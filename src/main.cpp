@@ -21,6 +21,7 @@
 #include <InputManager.h>
 #include <PowerManager.h>
 #include <SDCardManager.h>
+#include <BookCatalog.h>
 #include <cache/PageCache.h>
 #include <epub/ImageProbe.h>
 #include <css/Css.h>
@@ -217,7 +218,12 @@ struct ReaderSession {
   SdCacheStorage cache;
   book::Arena bookArena;
   book::Arena scratch;
-  book::Book bk;
+  // SD-backed container index — EVERY epub opens through it (one code path):
+  // fixed-size tables stay resident in the book arena, everything
+  // string-shaped lives on the card as catalog.fibc, built once per book.
+  // Webnovel omnibuses (1,700+ spine items, ~400 KB of metadata) cost the
+  // same ~44 KB resident as a novella, and reopens skip container parsing.
+  book::BookCatalog catalog;
   book::CssStylesheet sheet{};
   book::LayoutParams params;
   book::PageCacheReader reader;
@@ -240,6 +246,11 @@ struct ReaderSession {
   // PageCacheReader BORROWS this name for every later readPage() — it must
   // live as long as the reader, never on ensureChapter's stack.
   char cacheName[64];
+  // Current chapter identity as MEMBERS: the incremental layout session
+  // retains pointers across steps, and in catalog mode there is no
+  // arena-resident ZipEntry or href to point at.
+  book::ZipEntry curEntry{};
+  char chapterHref[512];
   uint32_t pageInChapter = 0;
   bool open = false;
   bool isTxt = false;  // plain-text document: one chapter, no container
@@ -258,16 +269,27 @@ struct ReaderSession {
     scratch.init(scratchBuf, scratchCap);
     indexArena.init(indexBuf, indexCap);
     readerValid = false;
+    catalog = book::BookCatalog();  // drop the previous book's index view
     if (!source.open(epubPath)) return false;
     const size_t plen = strlen(epubPath);
     isTxt = plen > 4 && strcmp(epubPath + plen - 4, ".txt") == 0;
-    if (!isTxt && bk.open(source, bookArena, scratch) != BookStatus::Ok) return false;
 
-    // Per-book cache directory from a path hash; progress lives beside it.
+    // Per-book cache directory from a path hash; progress lives beside it,
+    // and for very large containers so does the SD-backed catalog index —
+    // bind the dir before the catalog fast path below.
     const uint32_t id = book::ZipCatalog::hashPath(epubPath);
     snprintf(cacheDir, sizeof(cacheDir), "/BookCache/%08x", id);
     snprintf(progressPath, sizeof(progressPath), "%s/progress.bin", cacheDir);
     cache.setDir(cacheDir);
+
+    if (!isTxt) {
+      // Fast path: reuse an existing catalog.fibc (openCatalog deletes a
+      // stale one — changed container — so the rebuild below starts clean);
+      // otherwise stream the index to SD once and open it.
+      bool haveCatalog = cache.exists(book::BookCatalog::kCatalogName) && openCatalog();
+      if (!haveCatalog) haveCatalog = buildCatalog() && openCatalog();
+      if (!haveCatalog) return false;
+    }
     loadProgress();
 
     // Book stylesheet (all text/css manifest items). Plain text has none.
@@ -276,12 +298,9 @@ struct ReaderSession {
     static book::Arena sheetArena;
     sheetArena.init(sheetBuf, sizeof(sheetBuf));
     builder.begin(sheetArena);
-    for (size_t m = 0; isTxt ? false : m < bk.manifestCount(); ++m) {
-      const book::ManifestItem* item = bk.manifestItem(m);
-      if (strcmp(item->mediaType, "text/css") != 0) continue;
-      if (const book::ZipEntry* e = bk.zip().find(item->href)) {
-        builder.addSheet(source, *e, scratch);
-      }
+    // CSS entries were resolved when the catalog opened (none for txt).
+    for (size_t c = 0; c < catalog.cssCount(); ++c) {
+      builder.addSheet(source, *catalog.cssEntry(c), scratch);
     }
     sheet = builder.finish();
 
@@ -305,7 +324,7 @@ struct ReaderSession {
     static const book::TextAlign kAligns[4] = {book::TextAlign::Justify, book::TextAlign::Left,
                                                book::TextAlign::Center, book::TextAlign::Right};
     params.defaultAlign = kAligns[paraAlign];
-    params.language = (!isTxt && bk.metadata().language[0]) ? bk.metadata().language : "en";
+    params.language = (!isTxt && meta().language[0]) ? meta().language : "en";
 
     open = ensureChapter(pos.spineIndex) == BookStatus::Ok;
     if (open) {
@@ -327,6 +346,39 @@ struct ReaderSession {
   // Font fingerprint distinguishes TTF vs built-in layouts: metrics differ,
   // so caches from one font set must not serve the other.
   uint32_t generation() const;
+
+  // --- Container views (all through the SD-backed catalog) -----------------
+  const book::ZipCatalog& zip() const { return catalog.zip(); }
+  const book::BookMetadata& meta() const { return catalog.metadata(); }
+  size_t spineCount() const { return isTxt ? 1 : catalog.spineCount(); }
+  size_t tocCount() const { return isTxt ? 0 : catalog.tocCount(); }
+  int spineForHref(const char* href) const { return catalog.spineIndexForHref(href); }
+  // Resolves a spine item's ZipEntry + href into curEntry/chapterHref.
+  bool resolveSpineEntry(uint16_t spineIndex) {
+    return catalog.spineEntry(spineIndex, &curEntry) == BookStatus::Ok &&
+           catalog.spineHref(spineIndex, chapterHref, sizeof(chapterHref)) == BookStatus::Ok;
+  }
+
+  // Loads an existing catalog.fibc into the book arena (resident tables run
+  // ~44 KB for a 1,732-spine omnibus). A stale index — container changed
+  // since the build — is deleted so the caller can rebuild; any other
+  // failure just reports false.
+  bool openCatalog() {
+    bookArena.reset();
+    const size_t marked = scratch.mark();
+    const BookStatus st = catalog.open(source, cache, bookArena, scratch);
+    scratch.release(marked);
+    if (st == BookStatus::Stale) cache.remove(book::BookCatalog::kCatalogName);
+    return st == BookStatus::Ok;
+  }
+  // Streams the container index to SD. Records (~72 KB) and parse state
+  // (~46 KB) both fit the 512 KB scratch, so no arena split is needed.
+  bool buildCatalog() {
+    const size_t marked = scratch.mark();
+    const BookStatus st = book::BookCatalog::build(source, cache, scratch);
+    scratch.release(marked);
+    return st == BookStatus::Ok;
+  }
 
   // Opens the page cache for one spine item. A missing/stale/partial cache
   // starts an incremental build that loop() pumps a few pages per tick, so
@@ -368,16 +420,16 @@ struct ReaderSession {
       return st;
     }
 
-    const book::ManifestItem* item = bk.spineItem(spineIndex);
-    const book::ZipEntry* entry = item != nullptr ? bk.zip().find(item->href) : nullptr;
-    if (entry == nullptr) return readerValid ? BookStatus::Ok : BookStatus::NotFound;
+    if (!resolveSpineEntry(spineIndex)) {
+      return readerValid ? BookStatus::Ok : BookStatus::NotFound;
+    }
 
     extern uint8_t* buildBuf;
     buildArena.init(buildBuf, 512 * 1024);
     if (!writer.begin(cache, cacheName, hash, buildArena)) {
       return readerValid ? BookStatus::Ok : BookStatus::IoError;
     }
-    st = build.begin(source, &bk.zip(), source, *entry, item->href, params, buildArena, writer);
+    st = build.begin(source, &zip(), source, curEntry, chapterHref, params, buildArena, writer);
     if (st != BookStatus::Ok) {
       build.abort();
       cache.abandonWrite();  // nothing usable written; keep any good partial
@@ -519,7 +571,7 @@ struct ReaderSession {
       return false;
     }
     book::PageRenderer::renderText(page, fonts, target, nullptr);
-    book::PageRenderer::renderImages(page, source, bk.zip(), scratch, target);
+    book::PageRenderer::renderImages(page, source, zip(), scratch, target);
     pos.charStart = page.charStart;
     scratch.release(marked);
     return true;
@@ -534,7 +586,7 @@ struct ReaderSession {
         ++pageInChapter;
         return true;
       }
-      const size_t chapterCount = isTxt ? 1 : bk.spineCount();
+      const size_t chapterCount = spineCount();
       if (pos.spineIndex + 1u < chapterCount &&
           ensureChapter(pos.spineIndex + 1) == BookStatus::Ok) {
         ++pos.spineIndex;
@@ -561,10 +613,7 @@ struct ReaderSession {
     if (backDepth < 8) backStack[backDepth++] = {pos.spineIndex, pos.charStart};
     uint16_t targetSpine = pos.spineIndex;
     if (link.target[0] != 0) {
-      int found = -1;
-      for (size_t s = 0; s < bk.spineCount(); ++s) {
-        if (strcmp(bk.spineItem(s)->href, link.target) == 0) { found = static_cast<int>(s); break; }
-      }
+      const int found = spineForHref(link.target);
       if (found < 0) { if (backDepth) --backDepth; return false; }
       targetSpine = static_cast<uint16_t>(found);
     }
@@ -600,20 +649,22 @@ struct ReaderSession {
   }
 
   bool jumpToToc(size_t tocIndex) {
-    const book::TocEntry* toc = bk.tocEntry(tocIndex);
-    if (toc == nullptr) return false;
-    for (size_t s = 0; s < bk.spineCount(); ++s) {
-      if (strcmp(bk.spineItem(s)->href, toc->href) != 0) continue;
-      if (ensureChapter(static_cast<uint16_t>(s)) != BookStatus::Ok) return false;
-      pos.spineIndex = static_cast<uint16_t>(s);
-      pageInChapter = 0;
-      return true;
+    book::BookCatalog::TocItem t;
+    char title[2], frag[2];  // strings unused; the jump needs the spine only
+    if (catalog.tocItem(tocIndex, &t, title, sizeof(title), frag, sizeof(frag)) !=
+        BookStatus::Ok) {
+      return false;
     }
-    return false;
+    const int spine = t.spineIndex;
+    if (spine < 0) return false;
+    if (ensureChapter(static_cast<uint16_t>(spine)) != BookStatus::Ok) return false;
+    pos.spineIndex = static_cast<uint16_t>(spine);
+    pageInChapter = 0;
+    return true;
   }
 
   bool jumpToSpine(uint16_t spineIndex) {
-    if (spineIndex >= bk.spineCount()) return false;
+    if (spineIndex >= spineCount()) return false;
     if (ensureChapter(spineIndex) != BookStatus::Ok) return false;
     pos.spineIndex = spineIndex;
     pageInChapter = 0;
@@ -642,7 +693,7 @@ struct ReaderSession {
   }
   void saveProgress() {
     if (open) {
-      const uint32_t chapters = isTxt ? 1 : static_cast<uint32_t>(bk.spineCount());
+      const uint32_t chapters = static_cast<uint32_t>(spineCount());
       const uint32_t pages = chapterPageEstimate();
       uint32_t pct = chapters > 0
                          ? (static_cast<uint32_t>(pos.spineIndex) * 100u +
@@ -2062,28 +2113,33 @@ void readerScreen(App::ScreenType& s, void*) {
 
 void tocScreen(App::ScreenType& s, void*) {
   static ui::ListItem items[128];
-  static char fallbackLabels[128][32];
-  const bool hasToc = session.bk.tocCount() > 0;
+  // Label backing for catalog titles (copied from SD) and chapter fallbacks;
+  // in-RAM TOC labels point straight at the arena strings.
+  static char labels[128][48];
+  const bool hasToc = session.tocCount() > 0;
   const uint16_t n = static_cast<uint16_t>(
-      (hasToc ? session.bk.tocCount() : session.bk.spineCount()) < 128
-          ? (hasToc ? session.bk.tocCount() : session.bk.spineCount())
+      (hasToc ? session.tocCount() : session.spineCount()) < 128
+          ? (hasToc ? session.tocCount() : session.spineCount())
           : 128);
   int16_t selected = -1;
   for (uint16_t i = 0; i < n; ++i) {
     items[i] = ui::ListItem{};
-    if (hasToc) {
-      const book::TocEntry* toc = session.bk.tocEntry(i);
-      items[i].label = toc != nullptr ? toc->title : "";
-      if (selected < 0 && toc != nullptr) {
-        const book::ManifestItem* spine = session.bk.spineItem(session.pos.spineIndex);
-        if (spine != nullptr && strcmp(spine->href, toc->href) == 0) selected = static_cast<int16_t>(i);
-      }
-    } else {
-      snprintf(fallbackLabels[i], sizeof(fallbackLabels[i]), "Chapter %u", static_cast<unsigned>(i + 1));
-      items[i].label = fallbackLabels[i];
+    if (!hasToc) {
+      snprintf(labels[i], sizeof(labels[i]), "Chapter %u", static_cast<unsigned>(i + 1));
       if (i == session.pos.spineIndex) selected = static_cast<int16_t>(i);
+    } else {
+      book::BookCatalog::TocItem toc;
+      char frag[2];  // fragment unused here
+      labels[i][0] = 0;
+      session.catalog.tocItem(i, &toc, labels[i], sizeof(labels[i]), frag, sizeof(frag));
     }
+    items[i].label = labels[i];
     items[i].actionValue = static_cast<int16_t>(i);
+  }
+  if (hasToc) {
+    // Fixed-size record scan on SD; no title strings are read.
+    const int cur = session.catalog.tocIndexForSpine(session.pos.spineIndex);
+    if (cur >= 0 && cur < n) selected = static_cast<int16_t>(cur);
   }
   if (n == 0) {
     s.navHeader("Contents", ActionBackToReader, ui::BitmapRef{}, nullptr, ui::EdgesNone);
@@ -2576,8 +2632,8 @@ void scrollLibraryByPage(int8_t dir) {
 
 void scrollTocByPage(int8_t dir) {
   const uint16_t tocCount = static_cast<uint16_t>(
-      (session.bk.tocCount() > 0 ? session.bk.tocCount() : session.bk.spineCount()) < 128
-          ? (session.bk.tocCount() > 0 ? session.bk.tocCount() : session.bk.spineCount())
+      (session.tocCount() > 0 ? session.tocCount() : session.spineCount()) < 128
+          ? (session.tocCount() > 0 ? session.tocCount() : session.spineCount())
           : 128);
   if (tocCount <= tocVisibleRows || tocVisibleRows == 0) return;
   const uint16_t maxTop = static_cast<uint16_t>(tocCount - tocVisibleRows);
@@ -2648,7 +2704,7 @@ void onCenterTap(const ui::ActionEvent&, void*) {
 }
 
 void onTocJump(const ui::ActionEvent& e, void*) {
-  const bool ok = session.bk.tocCount() > 0
+  const bool ok = session.tocCount() > 0
                       ? session.jumpToToc(static_cast<size_t>(e.value))
                       : session.jumpToSpine(static_cast<uint16_t>(e.value));
   if (ok) {
@@ -2964,8 +3020,8 @@ void loop() {
       }
     } else if (screen == Screen::Toc && dy != 0) {
       const uint16_t tocCount = static_cast<uint16_t>(
-          (session.bk.tocCount() > 0 ? session.bk.tocCount() : session.bk.spineCount()) < 128
-              ? (session.bk.tocCount() > 0 ? session.bk.tocCount() : session.bk.spineCount())
+          (session.tocCount() > 0 ? session.tocCount() : session.spineCount()) < 128
+              ? (session.tocCount() > 0 ? session.tocCount() : session.spineCount())
               : 128);
       if (tocCount > tocVisibleRows && tocVisibleRows > 0) {
         const uint16_t maxTop = static_cast<uint16_t>(tocCount - tocVisibleRows);
