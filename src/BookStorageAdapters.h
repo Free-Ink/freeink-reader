@@ -53,7 +53,8 @@ class SdCacheStorage : public freeink::book::CacheStorage {
   }
   bool beginWrite(const char* name) override {
     snprintf(commitPath_, sizeof(commitPath_), "%s/%s", dir_, name);
-    write_ = SdMan.open(path("_tmp.fibp"), O_WRONLY | O_CREAT | O_TRUNC);
+    // Read-write so readBackAt() can serve already-written pages mid-build.
+    write_ = SdMan.open(path("_tmp.fibp"), O_RDWR | O_CREAT | O_TRUNC);
     return static_cast<bool>(write_);
   }
   bool write(const void* data, uint32_t len) override {
@@ -64,6 +65,24 @@ class SdCacheStorage : public freeink::book::CacheStorage {
     write_.close();
     SdMan.remove(commitPath_);
     return SdMan.rename(path("_tmp.fibp"), commitPath_);
+  }
+  // Serves PageCacheWriter::readPage() during an active build: seek, read,
+  // and restore the append cursor (the contract requires the write cursor
+  // undisturbed).
+  int32_t readBackAt(uint32_t offset, void* dst, uint32_t len) override {
+    if (!write_) return -1;
+    const uint64_t cur = write_.curPosition();
+    if (!write_.seekSet(offset)) return -1;
+    const int32_t n = write_.read(dst, len);
+    if (!write_.seekSet(cur)) return -1;
+    return n;
+  }
+  // Drops an in-flight write WITHOUT committing: the temp file goes away and
+  // the previously committed file (if any) stays. App-level teardown for
+  // abandoned incremental builds — CacheStorage has no abort verb.
+  void abandonWrite() {
+    if (write_) write_.close();
+    SdMan.remove(path("_tmp.fibp"));
   }
 
  private:

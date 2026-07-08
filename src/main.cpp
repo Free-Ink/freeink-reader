@@ -222,6 +222,18 @@ struct ReaderSession {
   book::LayoutParams params;
   book::PageCacheReader reader;
   book::Arena indexArena;
+  // Incremental chapter build (SDK ChapterLayoutSession): a missing/stale/
+  // partial cache lays out a few pages per loop() tick instead of blocking;
+  // pages are served from the writer's watermark while it runs, and a build
+  // interrupted by close/navigation is suspend()ed to a partial cache file
+  // that serves instantly on the next open.
+  book::PageCacheWriter writer;
+  book::ChapterLayoutSession build;
+  book::Arena buildArena;
+  bool building = false;
+  bool readerValid = false;  // reader.open() succeeded (final OR partial)
+  uint16_t buildingSpine = 0;
+  uint32_t buildingHash = 0;
   Progress pos;
   char cacheDir[96];
   char progressPath[128];
@@ -245,6 +257,7 @@ struct ReaderSession {
     bookArena.init(bookBuf, bookCap);
     scratch.init(scratchBuf, scratchCap);
     indexArena.init(indexBuf, indexCap);
+    readerValid = false;
     if (!source.open(epubPath)) return false;
     const size_t plen = strlen(epubPath);
     isTxt = plen > 4 && strcmp(epubPath + plen - 4, ".txt") == 0;
@@ -295,12 +308,18 @@ struct ReaderSession {
     params.language = (!isTxt && bk.metadata().language[0]) ? bk.metadata().language : "en";
 
     open = ensureChapter(pos.spineIndex) == BookStatus::Ok;
-    if (open) pageInChapter = reader.pageForChar(pos.charStart);
+    if (open) {
+      // The saved position may lie beyond a partial's watermark: pump the
+      // build until that character's page is addressable.
+      buildUntilChar(pos.charStart);
+      pageInChapter = pageForChar(pos.charStart);
+    }
     return open;
   }
 
   void end() {
     saveProgress();
+    suspendBuild();  // commit the build-so-far; next open serves it instantly
     source.close();
     open = false;
   }
@@ -309,38 +328,184 @@ struct ReaderSession {
   // so caches from one font set must not serve the other.
   uint32_t generation() const;
 
-  // Opens (building if stale/missing) the page cache for one spine item.
+  // Opens the page cache for one spine item. A missing/stale/partial cache
+  // starts an incremental build that loop() pumps a few pages per tick, so
+  // this returns once the FIRST page exists instead of after the whole
+  // chapter. Plain text keeps the one-shot path (not XML; lays out fast).
   BookStatus ensureChapter(uint16_t spineIndex) {
     const uint32_t hash = generation();
+    if (building && buildingSpine == spineIndex && buildingHash == hash) return BookStatus::Ok;
+    suspendBuild();  // leaving a chapter mid-build: commit the partial first
+
     book::pageCacheName(spineIndex, hash, cacheName, sizeof(cacheName));
     indexArena.reset();
     BookStatus st = reader.open(cache, cacheName, hash, indexArena);
-    if (st == BookStatus::Ok) return st;
-
-    const book::ManifestItem* item = isTxt ? nullptr : bk.spineItem(spineIndex);
-    const book::ZipEntry* entry =
-        (!isTxt && item != nullptr) ? bk.zip().find(item->href) : nullptr;
-    if (!isTxt && entry == nullptr) return BookStatus::NotFound;
-    if (isTxt && spineIndex != 0) return BookStatus::NotFound;  // one chapter
-
-    const size_t marked = scratch.mark();
-    book::PageCacheWriter writer;
-    if (!writer.begin(cache, cacheName, hash, scratch)) {
-      scratch.release(marked);
-      return BookStatus::IoError;
+    readerValid = st == BookStatus::Ok;
+    if (readerValid && reader.isPartial() && reader.pageCount() == 0) {
+      cache.remove(cacheName);  // useless empty partial; rebuild from scratch
+      readerValid = false;
     }
-    uint32_t totalChars = 0;
-    st = isTxt ? book::ChapterLayout::layoutPlainText(source, params, scratch, writer,
-                                                      nullptr, &totalChars)
-               : book::ChapterLayout::layout(source, bk.zip(), *entry, item->href, params,
-                                             scratch, writer, nullptr, &totalChars);
-    writer.setTotalChars(totalChars);
-    if (st == BookStatus::Ok && !writer.finish()) st = BookStatus::IoError;
-    scratch.release(marked);
-    if (st != BookStatus::Ok) return st;
+    if (readerValid && !reader.isPartial()) return BookStatus::Ok;
 
-    indexArena.reset();
-    return reader.open(cache, cacheName, hash, indexArena);
+    if (isTxt) {
+      if (spineIndex != 0) return BookStatus::NotFound;  // one chapter
+      const size_t marked = scratch.mark();
+      book::PageCacheWriter txtWriter;
+      if (!txtWriter.begin(cache, cacheName, hash, scratch)) {
+        scratch.release(marked);
+        return BookStatus::IoError;
+      }
+      uint32_t totalChars = 0;
+      st = book::ChapterLayout::layoutPlainText(source, params, scratch, txtWriter, nullptr,
+                                                &totalChars);
+      txtWriter.setTotalChars(totalChars);
+      if (st == BookStatus::Ok && !txtWriter.finish()) st = BookStatus::IoError;
+      scratch.release(marked);
+      if (st != BookStatus::Ok) return st;
+      indexArena.reset();
+      st = reader.open(cache, cacheName, hash, indexArena);
+      readerValid = st == BookStatus::Ok;
+      return st;
+    }
+
+    const book::ManifestItem* item = bk.spineItem(spineIndex);
+    const book::ZipEntry* entry = item != nullptr ? bk.zip().find(item->href) : nullptr;
+    if (entry == nullptr) return readerValid ? BookStatus::Ok : BookStatus::NotFound;
+
+    extern uint8_t* buildBuf;
+    buildArena.init(buildBuf, 512 * 1024);
+    if (!writer.begin(cache, cacheName, hash, buildArena)) {
+      return readerValid ? BookStatus::Ok : BookStatus::IoError;
+    }
+    st = build.begin(source, &bk.zip(), source, *entry, item->href, params, buildArena, writer);
+    if (st != BookStatus::Ok) {
+      build.abort();
+      cache.abandonWrite();  // nothing usable written; keep any good partial
+      return readerValid ? BookStatus::Ok : st;
+    }
+    building = true;
+    buildingSpine = spineIndex;
+    buildingHash = hash;
+    // Guarantee a renderable page before returning (a partial already
+    // serves its prefix; a fresh build needs at least one page).
+    while (building && chapterPageCount() == 0) pumpBuild(1);
+    return (readerValid || building) ? BookStatus::Ok : BookStatus::IoError;
+  }
+
+  // --- Incremental-build plumbing -----------------------------------------
+  // Pages visible right now come from the committed reader (final or
+  // partial) and, mid-build, the writer's watermark. The rebuild re-lays the
+  // same prefix deterministically, so whichever side has MORE pages wins.
+  uint32_t chapterPageCount() const {
+    const uint32_t rp = readerValid ? reader.pageCount() : 0;
+    const uint32_t wp = building ? writer.pageCount() : 0;
+    return wp > rp ? wp : rp;
+  }
+  uint32_t lastKnownCharStart() const {
+    const uint32_t rp = readerValid ? reader.pageCount() : 0;
+    const uint32_t wp = building ? writer.pageCount() : 0;
+    if (wp > rp) return writer.charStart(wp - 1);
+    return rp > 0 ? reader.charStart(rp - 1) : 0;
+  }
+  BookStatus readPageAt(uint32_t index, book::Arena& arena, book::Page* out) {
+    if (readerValid && index < reader.pageCount()) return reader.readPage(index, arena, out);
+    if (building && index < writer.pageCount()) return writer.readPage(index, arena, out);
+    return BookStatus::NotFound;
+  }
+  uint32_t pageForChar(uint32_t charOffset) const {
+    const uint32_t rp = readerValid ? reader.pageCount() : 0;
+    const uint32_t wp = building ? writer.pageCount() : 0;
+    if (wp > rp) return writer.pageForChar(charOffset);
+    return rp > 0 ? reader.pageForChar(charOffset) : 0;
+  }
+  bool charForAnchor(uint32_t idHash, uint32_t* charOut) const {
+    if (readerValid && reader.charForAnchor(idHash, charOut)) return true;
+    return building && writer.charForAnchor(idHash, charOut);
+  }
+
+  // Steps the in-flight build; called from loop() every idle tick and from
+  // the blocking waits below. Completion commits the final cache and swaps
+  // the reader onto it; a mid-chapter failure keeps the built prefix as a
+  // partial so the user can still read up to the watermark.
+  void pumpBuild(uint32_t minNewPages = 3) {
+    if (!building) return;
+    BookStatus st = BookStatus::Ok;
+    if (!build.done()) st = build.step(minNewPages);
+    if (build.done()) {
+      finishBuild();
+      return;
+    }
+    if (st != BookStatus::Ok || writer.failed()) suspendBuild();
+  }
+
+  // Blocks until the page containing `charOffset` is addressable (a later
+  // page's start is known) or the build ends — restores reading positions
+  // that lie beyond the built prefix.
+  void buildUntilChar(uint32_t charOffset) {
+    while (building && !(chapterPageCount() > 0 && lastKnownCharStart() > charOffset)) {
+      pumpBuild(4);
+    }
+  }
+  void buildUntilDone() {
+    while (building) pumpBuild(8);
+  }
+
+  void finishBuild() {
+    bool ok = false;
+    if (!writer.failed()) {
+      writer.setTotalChars(build.totalChars());
+      ok = writer.finish();
+    } else {
+      cache.abandonWrite();
+    }
+    build.abort();
+    building = false;
+    if (ok) {
+      indexArena.reset();
+      readerValid = reader.open(cache, cacheName, buildingHash, indexArena) == BookStatus::Ok;
+    }
+  }
+
+  // Commits the build-so-far as a partial cache file (the SDK's
+  // suspend/resume): reopening the book serves these pages instantly while
+  // a fresh background build re-lays the rest.
+  void suspendBuild() {
+    if (!building) return;
+    if (build.done()) {
+      finishBuild();
+      return;
+    }
+    bool committed = false;
+    if (!writer.failed() && writer.pageCount() > 0) {
+      committed = writer.suspend(static_cast<uint32_t>(build.bytesConsumed()),
+                                 static_cast<uint32_t>(build.bytesTotal()));
+    } else {
+      cache.abandonWrite();
+    }
+    build.abort();
+    building = false;
+    if (committed) {
+      indexArena.reset();
+      readerValid = reader.open(cache, cacheName, buildingHash, indexArena) == BookStatus::Ok;
+    }
+  }
+
+  // Total-page estimate while the chapter is incomplete: extrapolate the
+  // watermark by input-side build progress (pages * total / consumed).
+  uint32_t chapterPageEstimate() const {
+    uint32_t pages = chapterPageCount();
+    uint64_t consumed = 0, total = 0;
+    if (building) {
+      consumed = build.bytesConsumed();
+      total = build.bytesTotal();
+    } else if (readerValid && reader.isPartial()) {
+      consumed = reader.buildBytesConsumed();
+      total = reader.buildBytesTotal();
+    }
+    if (consumed > 0 && total > consumed) {
+      pages = static_cast<uint32_t>(static_cast<uint64_t>(pages) * total / consumed);
+    }
+    return pages > 0 ? pages : 1;
   }
 
   // Renders the current page into the framebuffer (chrome drawn separately).
@@ -348,7 +513,7 @@ struct ReaderSession {
   bool renderCurrent(book::FontChain& fonts, const book::FrameTarget& target) {
     const size_t marked = scratch.mark();
     book::Page page{};
-    const BookStatus rs = reader.readPage(pageInChapter, scratch, &page);
+    const BookStatus rs = readPageAt(pageInChapter, scratch, &page);
     if (rs != BookStatus::Ok) {
       scratch.release(marked);
       return false;
@@ -362,7 +527,10 @@ struct ReaderSession {
 
   bool turn(int direction) {  // +1 / -1; returns false at book edges
     if (direction > 0) {
-      if (pageInChapter + 1 < reader.pageCount()) {
+      // Mid-build the next page may simply not exist YET: pump until it
+      // appears or the chapter genuinely ends.
+      while (building && pageInChapter + 1 >= chapterPageCount()) pumpBuild(2);
+      if (pageInChapter + 1 < chapterPageCount()) {
         ++pageInChapter;
         return true;
       }
@@ -381,7 +549,8 @@ struct ReaderSession {
     }
     if (pos.spineIndex > 0 && ensureChapter(pos.spineIndex - 1) == BookStatus::Ok) {
       --pos.spineIndex;
-      pageInChapter = reader.pageCount() > 0 ? reader.pageCount() - 1 : 0;
+      buildUntilDone();  // the previous chapter's LAST page must be the real one
+      pageInChapter = chapterPageCount() > 0 ? chapterPageCount() - 1 : 0;
       return true;
     }
     return false;
@@ -402,9 +571,18 @@ struct ReaderSession {
     if (ensureChapter(targetSpine) != BookStatus::Ok) { if (backDepth) --backDepth; return false; }
     pos.spineIndex = targetSpine;
     uint32_t ch = 0;
-    if (link.fragment[0] != 0 &&
-        reader.charForAnchor(book::ZipCatalog::hashPath(link.fragment), &ch)) {
-      pageInChapter = reader.pageForChar(ch);
+    bool haveAnchor = false;
+    if (link.fragment[0] != 0) {
+      const uint32_t idHash = book::ZipCatalog::hashPath(link.fragment);
+      haveAnchor = charForAnchor(idHash, &ch);
+      if (!haveAnchor && building) {  // anchor may lie beyond the built prefix
+        buildUntilDone();
+        haveAnchor = charForAnchor(idHash, &ch);
+      }
+    }
+    if (haveAnchor) {
+      buildUntilChar(ch);
+      pageInChapter = pageForChar(ch);
     } else {
       pageInChapter = 0;
     }
@@ -416,7 +594,8 @@ struct ReaderSession {
     const BackEntry e = backStack[--backDepth];
     if (ensureChapter(e.spine) != BookStatus::Ok) return false;
     pos.spineIndex = e.spine;
-    pageInChapter = reader.pageForChar(e.charStart);
+    buildUntilChar(e.charStart);
+    pageInChapter = pageForChar(e.charStart);
     return true;
   }
 
@@ -446,7 +625,8 @@ struct ReaderSession {
     const uint32_t anchor = pos.charStart;
     pos.baseSizePx = params.baseSizePx = sizePx;
     if (ensureChapter(pos.spineIndex) != BookStatus::Ok) return false;
-    pageInChapter = reader.pageForChar(anchor);
+    buildUntilChar(anchor);
+    pageInChapter = pageForChar(anchor);
     return true;
   }
 
@@ -463,7 +643,7 @@ struct ReaderSession {
   void saveProgress() {
     if (open) {
       const uint32_t chapters = isTxt ? 1 : static_cast<uint32_t>(bk.spineCount());
-      const uint32_t pages = reader.pageCount() > 0 ? reader.pageCount() : 1;
+      const uint32_t pages = chapterPageEstimate();
       uint32_t pct = chapters > 0
                          ? (static_cast<uint32_t>(pos.spineIndex) * 100u +
                             (static_cast<uint32_t>(pageInChapter) * 100u) / pages) /
@@ -578,6 +758,8 @@ bool ignorePowerUntilRelease = true;
 uint8_t* bookBuf = nullptr;      // 256 KB PSRAM
 uint8_t* scratchBuf = nullptr;   // 512 KB PSRAM
 uint8_t* indexBuf = nullptr;     // 64 KB PSRAM
+uint8_t* buildBuf = nullptr;     // 512 KB PSRAM — incremental chapter build
+                                 // (session parse state + writer page index)
 uint8_t* glyphBuf = nullptr;     // 128 KB PSRAM
 uint8_t* fontFile = nullptr;     // TTF bytes, PSRAM
 uint32_t fontFileCap = 0;
@@ -2625,6 +2807,7 @@ void setup() {
   bookBuf = psAlloc(512 * 1024);  // webnovel omnibuses: 1800+ entries need >256KB
   scratchBuf = psAlloc(512 * 1024);
   indexBuf = psAlloc(64 * 1024);
+  buildBuf = psAlloc(512 * 1024);
   glyphBuf = psAlloc(128 * 1024);
   coverBookBuf = psAlloc(512 * 1024);  // omnibus ZIP catalogs need the same room as reading
   coverScratchBuf = psAlloc(192 * 1024);
@@ -2867,6 +3050,10 @@ void loop() {
     libraryRefreshPainted = false;
     goToPage(Screen::Library, /*initialPaint=*/true);
   }
+
+  // Advance an in-flight chapter build a few pages per idle tick; completion
+  // commits the cache, failure keeps the built prefix as a partial.
+  if (session.open) session.pumpBuild();
 
   // Deep sleep only on a genuine live hold: GPIO4 is the shared
   // CONFIRM/POWER button, and a stale held-time reading here would put the
