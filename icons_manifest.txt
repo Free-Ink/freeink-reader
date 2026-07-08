@@ -1,0 +1,17 @@
+settings = settings
+book = book-open
+folder = folder
+refresh = refresh-cw
+clock = clock
+type = type
+text_size = a-arrow-up
+ui_font = case-sensitive
+line_spacing = rows-3
+margin = move-horizontal
+align = align-horizontal-justify-center
+orientation = rotate-cw
+hyphen = whole-word
+sharp = contrast
+paragraph = pilcrow
+embedded = file-code
+focus = focus

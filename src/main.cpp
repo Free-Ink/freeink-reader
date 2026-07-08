@@ -60,7 +60,6 @@ enum : ui::ActionId {
   ActionToc,
   ActionTocJump,
   ActionFontSize,
-  ActionSettings,
   ActionPickFont,
   ActionPickSize,
   ActionFontMenu,
@@ -85,7 +84,7 @@ enum : ui::ActionId {
   ActionLibraryTab,
 };
 
-enum class Screen : uint8_t { Boot, Library, Reader, Toc, Settings, Sleep };
+enum class Screen : uint8_t { Boot, Library, Reader, Toc, Sleep };
 
 // ---------------------------------------------------------------------------
 // Stores
@@ -103,6 +102,25 @@ bool containsIgnoreCase(const char* haystack, const char* needle) {
     if (*b == 0) return true;
   }
   return false;
+}
+
+bool isBookFileName(const char* name) {
+  if (name == nullptr) return false;
+  const size_t len = strlen(name);
+  if (len > 5 && strcasecmp(name + len - 5, ".epub") == 0) return true;
+  if (len > 4 && strcasecmp(name + len - 4, ".txt") == 0) return true;
+  return false;
+}
+
+bool isCrashReportName(const char* name) {
+  return containsIgnoreCase(name, "crash") || containsIgnoreCase(name, "panic") ||
+         containsIgnoreCase(name, "backtrace");
+}
+
+bool isHiddenOrSystemDir(const char* name) {
+  if (name == nullptr || name[0] == 0 || name[0] == '.') return true;
+  return strcasecmp(name, "BookCache") == 0 || strcasecmp(name, "System Volume Information") == 0 ||
+         strcasecmp(name, "fonts") == 0;
 }
 
 struct Shelf {
@@ -125,8 +143,7 @@ struct Shelf {
     SdMan.ensureDirectoryExists("/BookCache/shelf");
     releaseCovers();
     count = 0;
-    addFrom("/");       // books anywhere: card root works out of the box
-    addFrom("/Books");  // ...and a Books folder for the tidy
+    addFrom("/", 0);  // books anywhere: card root works out of the box
   }
 
   void releaseCovers() {
@@ -143,18 +160,36 @@ struct Shelf {
     }
   }
 
-  void addFrom(const char* dir) {
+  void addFrom(const char* dir, uint8_t depth) {
     const bool root = dir[0] == '/' && dir[1] == 0;
-    for (const String& name : SdMan.listFiles(dir, kMax)) {
-      const bool isEpub = name.endsWith(".epub");
-      const bool isTxt = name.endsWith(".txt");
-      const bool isCrashReport = containsIgnoreCase(name.c_str(), "crash") ||
-                                 containsIgnoreCase(name.c_str(), "panic") ||
-                                 containsIgnoreCase(name.c_str(), "backtrace");
-      if (name.startsWith(".") || isCrashReport || (!isEpub && !isTxt) || count >= kMax) continue;
-      snprintf(paths[count], sizeof(paths[count]), "%s%s%s", dir, root ? "" : "/", name.c_str());
+    FsFile d = SdMan.open(dir, O_RDONLY);
+    if (!d || !d.isDirectory()) {
+      if (d) d.close();
+      return;
+    }
+    char name[128];
+    for (FsFile f = d.openNextFile(); f && count < kMax; f = d.openNextFile()) {
+      f.getName(name, sizeof(name));
+      if (f.isDirectory()) {
+        if (depth < 6 && !isHiddenOrSystemDir(name)) {
+          char child[160];
+          snprintf(child, sizeof(child), "%s%s%s", dir, root ? "" : "/", name);
+          f.close();
+          addFrom(child, static_cast<uint8_t>(depth + 1));
+          continue;
+        }
+        f.close();
+        continue;
+      }
+      f.close();
+      const bool isBook = isBookFileName(name);
+      const bool isCrashReport = isCrashReportName(name);
+      if (name[0] == '.' || isCrashReport || !isBook || count >= kMax) continue;
+      snprintf(paths[count], sizeof(paths[count]), "%s%s%s", dir, root ? "" : "/", name);
+      const size_t nameLen = strlen(name);
+      const bool isEpub = nameLen > 5 && strcasecmp(name + nameLen - 5, ".epub") == 0;
       snprintf(titles[count], sizeof(titles[count]), "%.*s",
-               static_cast<int>(name.length() - (isEpub ? 5 : 4)), name.c_str());
+               static_cast<int>(nameLen - (isEpub ? 5 : 4)), name);
       snprintf(metas[count], sizeof(metas[count]), "%s", dir);
       items[count] = ui::ListItem{};
       items[count].label = titles[count];
@@ -166,6 +201,7 @@ struct Shelf {
       loadCachedEntry(static_cast<uint16_t>(count));
       ++count;
     }
+    d.close();
   }
 
   bool loadCachedEntry(uint16_t index);
@@ -521,6 +557,21 @@ uint16_t libraryTop = 0;
 uint16_t libraryVisibleCells = 0;
 uint16_t allBooksTop = 0;
 uint16_t allBooksVisibleRows = 0;
+static constexpr uint16_t kAllBooksMaxRows = 48;
+enum class BrowserEntryKind : uint8_t { Up, Folder, Book };
+char allBooksPath[160] = "/";
+char allBooksEntryNames[kAllBooksMaxRows][64];
+int16_t allBooksEntryShelfIndex[kAllBooksMaxRows];
+BrowserEntryKind allBooksEntryKind[kAllBooksMaxRows];
+ui::ListItem allBooksItems[kAllBooksMaxRows];
+uint16_t allBooksEntryCount = 0;
+int16_t allBooksSelected = 0;
+bool allBooksBrowserDirty = true;
+static constexpr uint16_t kRecentBookLimit = 4;
+uint32_t recentHashes[Shelf::kMax];
+int16_t recentShelfForSlot[Shelf::kMax];
+uint8_t recentHashCount = 0;
+uint8_t recentVisibleCount = 0;
 uint16_t tocTop = 0;
 uint16_t tocVisibleRows = 0;
 bool tocAnchorSelected = false;
@@ -599,6 +650,199 @@ static constexpr uint16_t kShelfCacheVersion = 2;
 
 uint32_t shelfPathHash(const char* path) {
   return book::ZipCatalog::hashPath(path);
+}
+
+void loadRecentHashes() {
+  recentHashCount = 0;
+  FsFile f = SdMan.open("/BookCache/recent.bin", O_RDONLY);
+  if (!f) return;
+  uint32_t magic = 0;
+  uint16_t version = 0;
+  uint16_t count = 0;
+  if (f.read(&magic, sizeof(magic)) != sizeof(magic) ||
+      f.read(&version, sizeof(version)) != sizeof(version) ||
+      f.read(&count, sizeof(count)) != sizeof(count) ||
+      magic != 0x46425243 || version != 1) {
+    f.close();
+    return;
+  }
+  if (count > Shelf::kMax) count = Shelf::kMax;
+  for (uint16_t i = 0; i < count; ++i) {
+    uint32_t hash = 0;
+    if (f.read(&hash, sizeof(hash)) != sizeof(hash)) break;
+    recentHashes[recentHashCount++] = hash;
+  }
+  f.close();
+}
+
+void saveRecentHashes() {
+  SdMan.ensureDirectoryExists("/BookCache");
+  FsFile f = SdMan.open("/BookCache/recent.tmp", O_WRONLY | O_CREAT | O_TRUNC);
+  if (!f) return;
+  const uint32_t magic = 0x46425243;  // FBRC
+  const uint16_t version = 1;
+  const uint16_t count = recentHashCount;
+  bool ok = f.write(&magic, sizeof(magic)) == sizeof(magic) &&
+            f.write(&version, sizeof(version)) == sizeof(version) &&
+            f.write(&count, sizeof(count)) == sizeof(count);
+  for (uint16_t i = 0; ok && i < count; ++i) {
+    ok = f.write(&recentHashes[i], sizeof(recentHashes[i])) == sizeof(recentHashes[i]);
+  }
+  f.close();
+  if (!ok) {
+    SdMan.remove("/BookCache/recent.tmp");
+    return;
+  }
+  SdMan.remove("/BookCache/recent.bin");
+  SdMan.rename("/BookCache/recent.tmp", "/BookCache/recent.bin");
+}
+
+int16_t shelfIndexForHash(uint32_t hash) {
+  for (int i = 0; i < shelf.count; ++i) {
+    if (shelfPathHash(shelf.paths[i]) == hash) return static_cast<int16_t>(i);
+  }
+  return -1;
+}
+
+void rebuildRecentShelfSlots() {
+  recentVisibleCount = 0;
+  for (uint8_t i = 0; i < Shelf::kMax; ++i) recentShelfForSlot[i] = -1;
+  for (uint8_t i = 0; i < recentHashCount && recentVisibleCount < kRecentBookLimit; ++i) {
+    const int16_t shelfIndex = shelfIndexForHash(recentHashes[i]);
+    if (shelfIndex >= 0) recentShelfForSlot[recentVisibleCount++] = shelfIndex;
+  }
+  for (int16_t shelfIndex = 0; shelfIndex < shelf.count && recentVisibleCount < kRecentBookLimit; ++shelfIndex) {
+    bool alreadyShown = false;
+    for (uint8_t i = 0; i < recentVisibleCount; ++i) {
+      if (recentShelfForSlot[i] == shelfIndex) {
+        alreadyShown = true;
+        break;
+      }
+    }
+    if (!alreadyShown) recentShelfForSlot[recentVisibleCount++] = shelfIndex;
+  }
+}
+
+void promoteRecentBook(uint16_t shelfIndex) {
+  if (shelfIndex >= shelf.count) return;
+  const uint32_t hash = shelfPathHash(shelf.paths[shelfIndex]);
+  uint8_t out = 0;
+  uint32_t next[Shelf::kMax];
+  next[out++] = hash;
+  for (uint8_t i = 0; i < recentHashCount && out < Shelf::kMax; ++i) {
+    if (recentHashes[i] == hash) continue;
+    if (shelfIndexForHash(recentHashes[i]) < 0) continue;
+    next[out++] = recentHashes[i];
+  }
+  memcpy(recentHashes, next, out * sizeof(uint32_t));
+  recentHashCount = out;
+  rebuildRecentShelfSlots();
+  saveRecentHashes();
+}
+
+int16_t shelfIndexForPath(const char* path) {
+  for (int i = 0; i < shelf.count; ++i) {
+    if (strcmp(shelf.paths[i], path) == 0) return static_cast<int16_t>(i);
+  }
+  return -1;
+}
+
+bool browserAtRoot() {
+  return allBooksPath[0] == '/' && allBooksPath[1] == 0;
+}
+
+void browserParentPath(char* out, size_t outLen) {
+  if (out == nullptr || outLen == 0) return;
+  snprintf(out, outLen, "%s", allBooksPath);
+  if (out[0] == '/' && out[1] == 0) return;
+  char* slash = strrchr(out, '/');
+  if (slash == nullptr || slash == out) {
+    snprintf(out, outLen, "/");
+  } else {
+    *slash = 0;
+  }
+}
+
+void browserJoinPath(const char* dir, const char* name, char* out, size_t outLen) {
+  const bool root = dir != nullptr && dir[0] == '/' && dir[1] == 0;
+  snprintf(out, outLen, "%s%s%s", dir != nullptr ? dir : "/", root ? "" : "/", name != nullptr ? name : "");
+}
+
+void resetAllBooksBrowser(const char* path = "/") {
+  snprintf(allBooksPath, sizeof(allBooksPath), "%s", (path != nullptr && path[0]) ? path : "/");
+  allBooksTop = 0;
+  allBooksSelected = 0;
+  allBooksBrowserDirty = true;
+}
+
+void addBrowserEntry(BrowserEntryKind kind, const char* label, const char* subtitle, int16_t shelfIndex) {
+  if (allBooksEntryCount >= kAllBooksMaxRows) return;
+  const uint16_t i = allBooksEntryCount++;
+  snprintf(allBooksEntryNames[i], sizeof(allBooksEntryNames[i]), "%s", label != nullptr ? label : "");
+  allBooksEntryShelfIndex[i] = shelfIndex;
+  allBooksEntryKind[i] = kind;
+  allBooksItems[i] = ui::ListItem{};
+  allBooksItems[i].label = allBooksEntryNames[i];
+  allBooksItems[i].subtitle = subtitle;
+  allBooksItems[i].actionValue = static_cast<int16_t>(i);
+}
+
+void rebuildAllBooksBrowser() {
+  allBooksEntryCount = 0;
+  if (!browserAtRoot()) {
+    addBrowserEntry(BrowserEntryKind::Up, "Back", "Parent folder", -1);
+  }
+
+  FsFile dir = SdMan.open(allBooksPath, O_RDONLY);
+  if (!dir || !dir.isDirectory()) {
+    if (dir) dir.close();
+    resetAllBooksBrowser("/");
+    dir = SdMan.open(allBooksPath, O_RDONLY);
+  }
+  if (!dir || !dir.isDirectory()) {
+    if (dir) dir.close();
+    allBooksBrowserDirty = false;
+    return;
+  }
+
+  char name[128];
+  for (FsFile f = dir.openNextFile(); f && allBooksEntryCount < kAllBooksMaxRows; f = dir.openNextFile()) {
+    f.getName(name, sizeof(name));
+    const bool isDir = f.isDirectory();
+    f.close();
+    if (isDir) {
+      if (isHiddenOrSystemDir(name)) continue;
+      addBrowserEntry(BrowserEntryKind::Folder, name, "Folder", -1);
+    }
+  }
+  dir.close();
+
+  dir = SdMan.open(allBooksPath, O_RDONLY);
+  if (!dir || !dir.isDirectory()) {
+    if (dir) dir.close();
+    allBooksBrowserDirty = false;
+    return;
+  }
+  for (FsFile f = dir.openNextFile(); f && allBooksEntryCount < kAllBooksMaxRows; f = dir.openNextFile()) {
+    f.getName(name, sizeof(name));
+    const bool isDir = f.isDirectory();
+    f.close();
+    if (isDir || name[0] == '.' || !isBookFileName(name) || isCrashReportName(name)) continue;
+    char path[160];
+    browserJoinPath(allBooksPath, name, path, sizeof(path));
+    const int16_t shelfIndex = shelfIndexForPath(path);
+    if (shelfIndex < 0) continue;
+    shelf.ensureDetails(static_cast<uint16_t>(shelfIndex));
+    addBrowserEntry(BrowserEntryKind::Book, shelf.titles[shelfIndex],
+                    shelf.authors[shelfIndex][0] ? shelf.authors[shelfIndex] : shelf.metas[shelfIndex],
+                    shelfIndex);
+  }
+  dir.close();
+
+  if (allBooksSelected >= static_cast<int16_t>(allBooksEntryCount)) {
+    allBooksSelected = allBooksEntryCount > 0 ? static_cast<int16_t>(allBooksEntryCount - 1) : 0;
+  }
+  allBooksBrowserDirty = false;
 }
 
 uint16_t shelfCoverStride() {
@@ -780,12 +1024,12 @@ void Shelf::ensureDetails(uint16_t index) {
 
   book::Arena bookArena;
   book::Arena scratch;
-  bookArena.init(coverBookBuf, 128 * 1024);
+  bookArena.init(coverBookBuf, 512 * 1024);
   scratch.init(coverScratchBuf, 192 * 1024);
   book::Book bk;
   const BookStatus openStatus = bk.open(source, bookArena, scratch);
   if (openStatus != BookStatus::Ok) {
-    LOGF("[cover] %s: book open status %d\n", paths[index], (int)openStatus);
+    LOGF("[cover] %s: book open %s\n", paths[index], book::bookStatusName(openStatus));
   }
   if (openStatus == BookStatus::Ok) {
     if (bk.metadata().title != nullptr && bk.metadata().title[0] != 0) {
@@ -836,7 +1080,7 @@ bool Shelf::ensureCover(uint16_t index) {
   }
   book::Arena bookArena;
   book::Arena scratch;
-  bookArena.init(coverBookBuf, 128 * 1024);
+  bookArena.init(coverBookBuf, 512 * 1024);
   scratch.init(coverScratchBuf, 192 * 1024);
   book::Book bk;
   bool ok = false;
@@ -870,7 +1114,11 @@ bool Shelf::ensureCover(uint16_t index) {
       const BookStatus rs =
           book::ImageRenderer::render(source, bk.zip(), image, scratch, coverDecodeRow, &ctx);
       ok = rs == BookStatus::Ok;
-      if (!ok) LOGF("[cover] %s: render status %d\n", coverHrefs[index], (int)rs);
+      if (!ok) {
+        LOGF("[cover] %s: render %s (probe kind=%d %ux%u prog=%d)\n", coverHrefs[index],
+             book::bookStatusName(rs), (int)info.kind, info.width, info.height,
+             (int)info.progressive);
+      }
       scratch.release(mark);
     } else {
       LOGF("[cover] %s: zip entry not found\n", coverHrefs[index]);
@@ -901,14 +1149,27 @@ ui::CoverGridItem libraryGridItem(uint16_t index, void*) {
   return shelf.gridItem(index);
 }
 
+ui::CoverGridItem recentGridItem(uint16_t index, void*) {
+  if (index >= recentVisibleCount || recentShelfForSlot[index] < 0) return ui::CoverGridItem{};
+  return shelf.gridItem(static_cast<uint16_t>(recentShelfForSlot[index]));
+}
+
 ui::BitmapRef iconBook16();
+ui::BitmapRef iconFolder16();
+ui::BitmapRef iconSettings16();
+ui::BitmapRef iconRecent16();
+ui::BitmapRef settingIconForIndex(uint16_t index);
 
 ui::BitmapRef iconRef(const Icon& icon) {
   return ui::BitmapRef{icon.bits, icon.w, icon.h, ui::BitmapFormat::Mask1};
 }
 
-ui::BitmapRef iconSettings24() {
-  return ui::bitmapFromIcon(icon_settings_48);  // generated (gen_icons.py)
+ui::BitmapRef iconSettings16() {
+  return ui::bitmapFromIcon(icon_settings_22);
+}
+
+ui::BitmapRef iconRecent16() {
+  return ui::bitmapFromIcon(icon_clock_22);
 }
 
 uint8_t gray2At(const uint8_t* bits, uint16_t stride, uint16_t x, uint16_t y) {
@@ -995,6 +1256,31 @@ bool libraryCoverPainter(ui::DrawTarget& draw, ui::Rect rect, const ui::CoverGri
   return true;
 }
 
+bool recentCoverPainter(ui::DrawTarget& draw, ui::Rect rect, const ui::CoverGridItem& item,
+                        uint16_t index, void*) {
+  if (index >= recentVisibleCount || recentShelfForSlot[index] < 0) return false;
+  return libraryCoverPainter(draw, rect, item, static_cast<uint16_t>(recentShelfForSlot[index]), nullptr);
+}
+
+void drawRecentManualCell(App::ScreenType& s, uint8_t slot, ui::Rect coverRect, bool selected) {
+  if (slot >= recentVisibleCount || recentShelfForSlot[slot] < 0) return;
+  ui::CoverGridItem item = recentGridItem(slot, nullptr);
+  ui::Rect hitRect = ui::ensureMinTouchRect(coverRect, s.theme().minTouchSize, s.frame().screen());
+  ui::State state = selected ? ui::StateSelected : ui::StateNormal;
+  s.frame().hit(hitRect, ActionOpenBook, item.actionValue, ui::InputDefault, state);
+  state = s.frame().stateFor(ActionOpenBook, item.actionValue, state);
+  const bool active = (state & ui::StateSelected) != 0;
+  recentCoverPainter(s.frame().target(), coverRect, item, slot, nullptr);
+  if (active) {
+    const int16_t gap = 4;
+    s.frame().target().stroke(
+        ui::Rect{static_cast<int16_t>(coverRect.x - gap), static_cast<int16_t>(coverRect.y - gap),
+                 static_cast<int16_t>(coverRect.width + gap * 2),
+                 static_cast<int16_t>(coverRect.height + gap * 2)},
+        ui::Paint::solid(ui::Color::Black), 2, 5);
+  }
+}
+
 void drawLibraryCoverPreview(ui::DrawTarget& draw, ui::Rect rect, uint16_t index) {
   if (rect.height <= 0 || rect.width <= 0 || index >= shelf.count) return;
   draw.fill(rect, ui::Paint::solid(ui::Color::White), 4);
@@ -1047,6 +1333,10 @@ ui::BitmapRef iconBook16() {
   return ui::bitmapFromIcon(icon_book_22);  // generated (gen_icons.py)
 }
 
+ui::BitmapRef iconFolder16() {
+  return ui::bitmapFromIcon(icon_folder_22);
+}
+
 ui::BitmapRef iconText16() {
   static constexpr uint8_t bits[] = {
       0x00, 0x00, 0x7F, 0xFE, 0x04, 0x20, 0x04, 0x20,
@@ -1059,6 +1349,38 @@ ui::BitmapRef iconText16() {
 
 ui::BitmapRef iconRefresh16() {
   return ui::bitmapFromIcon(icon_refresh_22);  // generated (gen_icons.py)
+}
+
+ui::BitmapRef iconType16() { return ui::bitmapFromIcon(icon_type_22); }
+ui::BitmapRef iconTextSize16() { return ui::bitmapFromIcon(icon_text_size_22); }
+ui::BitmapRef iconUiFont16() { return ui::bitmapFromIcon(icon_ui_font_22); }
+ui::BitmapRef iconLineSpacing16() { return ui::bitmapFromIcon(icon_line_spacing_22); }
+ui::BitmapRef iconMargin16() { return ui::bitmapFromIcon(icon_margin_22); }
+ui::BitmapRef iconAlign16() { return ui::bitmapFromIcon(icon_align_22); }
+ui::BitmapRef iconOrientation16() { return ui::bitmapFromIcon(icon_orientation_22); }
+ui::BitmapRef iconHyphen16() { return ui::bitmapFromIcon(icon_hyphen_22); }
+ui::BitmapRef iconSharp16() { return ui::bitmapFromIcon(icon_sharp_22); }
+ui::BitmapRef iconParagraph16() { return ui::bitmapFromIcon(icon_paragraph_22); }
+ui::BitmapRef iconEmbedded16() { return ui::bitmapFromIcon(icon_embedded_22); }
+ui::BitmapRef iconFocus16() { return ui::bitmapFromIcon(icon_focus_22); }
+
+ui::BitmapRef settingIconForIndex(uint16_t index) {
+  switch (index) {
+    case 0: return iconRefresh16();
+    case 1: return iconType16();
+    case 2: return iconTextSize16();
+    case 3: return iconUiFont16();
+    case 4: return iconLineSpacing16();
+    case 5: return iconMargin16();
+    case 6: return iconAlign16();
+    case 7: return iconOrientation16();
+    case 8: return iconHyphen16();
+    case 9: return iconSharp16();
+    case 10: return iconParagraph16();
+    case 11: return iconEmbedded16();
+    case 12: return iconFocus16();
+    default: return iconSettings16();
+  }
 }
 
 ui::StyleSet roundedRowStyles(uint8_t radius = 8) {
@@ -1269,60 +1591,109 @@ void applyUiFont() {
 // ---------------------------------------------------------------------------
 // Screens (FreeInkUI)
 
-void libraryScreen(App::ScreenType& s, void*) {
-  const uint16_t pct = battery.readPercentage();
-  snprintf(statusText, sizeof(statusText), "%u books", static_cast<unsigned>(shelf.count));
-  char batteryMeta[12];
-  snprintf(batteryMeta, sizeof(batteryMeta), "%u%%", pct);
-  s.insetContent(ui::Insets{0, 14, 0, 16});
+void drawSettingsContent(App::ScreenType& s, bool withNavHeader);
 
-  ui::HeaderProps h1;
-  h1.title = statusText;
-  h1.rightLabel = batteryMeta;
-  h1.titleOffsetY = -4;
-  h1.borderEdges = 0;  // borderless: it is a headline, not chrome
-  s.header(h1);
-  s.spacer(12);
-  ui::Rect actions = s.takeBottom(18);
-  ui::ButtonProps settings;
-  settings.icon = iconSettings24();
-  settings.iconSize = 34;  // scaled up from the 24px asset, but keep footer compact
-  settings.action = ActionSettings;
-  settings.styles = s.theme().button;
-  settings.radius = 8;
-  settings.minTouchSize = 44;
-  settings.hitPadding = {2, 4, 2, 4};
-  ui::Rect settingsRect{static_cast<int16_t>(actions.right() - 48),
-                        static_cast<int16_t>(actions.bottom() - 44), 44, 44};
-  ui::button(s.frame(), settingsRect, settings);
+static constexpr int16_t kLibraryTabHeight = 104;
+
+void drawLibraryTabs(App::ScreenType& s, ui::Rect rect) {
+  ui::TabItem tabs[3] = {
+      ui::tabItem(static_cast<int>(LibraryTab::Recent), libraryTab == LibraryTab::Recent, true, "Recent"),
+      ui::tabItem(static_cast<int>(LibraryTab::AllBooks), libraryTab == LibraryTab::AllBooks, true, "All Books"),
+      ui::tabItem(static_cast<int>(LibraryTab::Settings), libraryTab == LibraryTab::Settings, true, "Settings"),
+  };
+  tabs[0].icon = iconRecent16();
+  tabs[1].icon = iconBook16();
+  tabs[2].icon = iconSettings16();
+  ui::TabBarProps props;
+  props.tabs = tabs;
+  props.count = 3;
+  props.action = ActionLibraryTab;
+  props.text = s.theme().smallText;
+  props.tabStyles = ui::flatButtonStyles(8);
+  props.tabStyles.normal.background = ui::Paint::none();
+  props.tabStyles.normal.foreground = ui::Paint::solid(ui::Color::Black);
+  props.tabStyles.selected.background = ui::Paint::none();
+  props.tabStyles.selected.foreground = ui::Paint::solid(ui::Color::Black);
+  props.tabStyles.focused = props.tabStyles.normal;
+  props.tabStyles.active = props.tabStyles.normal;
+  props.tabInset = {6, 2, 6, 2};
+  props.contentInset = {12, 16, 20, 16};
+  props.iconSize = 34;
+  props.selectedDotSize = 8;
+  props.selectedDotInsetBottom = 5;
+  props.divider = true;
+  ui::tabBar(s.frame(), rect, props);
+}
+
+void drawRecentGrid(App::ScreenType& s) {
   if (shelf.count == 0) {
     s.centeredText("No books found.\nCopy .epub files to /Books on the SD card.");
+    libraryVisibleCells = 0;
     return;
   }
   const ui::Rect gridBounds = s.body();
   ui::Rect body = gridBounds;
   const uint8_t columns = 2;
-  const int16_t rowHeight = static_cast<int16_t>(Shelf::kCoverH + 8);
-  const int16_t rowGap = 7;
+  const int16_t rowGap = 10;
+  int16_t recentCoverH = static_cast<int16_t>((body.height - rowGap - 8) / 2);
+  if (recentCoverH > Shelf::kCoverH) recentCoverH = Shelf::kCoverH;
+  if (recentCoverH < 190) recentCoverH = 190;
+  const int16_t recentCoverW = static_cast<int16_t>((static_cast<int32_t>(recentCoverH) * 2) / 3);
+  const int16_t rowHeight = static_cast<int16_t>(recentCoverH + 4);
   const int16_t columnGap = 36;
+  rebuildRecentShelfSlots();
   const int16_t packedGridW =
-      static_cast<int16_t>(columns * (Shelf::kCoverW + 8) + (columns - 1) * columnGap);
+      static_cast<int16_t>(columns * (recentCoverW + 8) + (columns - 1) * columnGap);
   if (packedGridW < body.width) {
     body.x = static_cast<int16_t>(body.x + (body.width - packedGridW) / 2);
     body.width = packedGridW;
   }
+  const int16_t gridRows = recentVisibleCount <= 2 ? recentVisibleCount : 2;
+  if (gridRows > 0) {
+    const int16_t gridH = static_cast<int16_t>(gridRows * rowHeight + (gridRows - 1) * rowGap);
+    if (gridH < body.height) {
+      body.y = static_cast<int16_t>(body.y + (body.height - gridH) / 2);
+      body.height = gridH;
+    }
+  }
   const uint16_t visible = ui::coverGridVisibleCells(body, columns, rowHeight, rowGap);
   libraryVisibleCells = visible;
-  libraryTop = ui::coverGridTopIndexFor(static_cast<uint16_t>(librarySelected),
-                                        static_cast<uint16_t>(shelf.count), columns, visible);
+  int16_t selectedSlot = -1;
+  for (uint8_t i = 0; i < recentVisibleCount; ++i) {
+    if (recentShelfForSlot[i] == librarySelected) {
+      selectedSlot = i;
+      break;
+    }
+  }
+  if (selectedSlot < 0 && recentVisibleCount > 0) selectedSlot = 0;
+  libraryTop = 0;
+  if (recentVisibleCount <= 2) {
+    const int16_t singleCoverH = recentVisibleCount == 1
+                                     ? recentCoverH
+                                     : static_cast<int16_t>((body.height - rowGap - 12) / 2);
+    const int16_t coverH = singleCoverH > Shelf::kCoverH ? Shelf::kCoverH : singleCoverH;
+    const int16_t coverW = static_cast<int16_t>((static_cast<int32_t>(coverH) * 2) / 3);
+    const int16_t x = static_cast<int16_t>(body.x + (body.width - coverW) / 2);
+    if (recentVisibleCount == 1) {
+      const int16_t y = static_cast<int16_t>(body.y + (body.height - coverH) / 2);
+      drawRecentManualCell(s, 0, ui::Rect{x, y, coverW, coverH}, selectedSlot == 0);
+    } else {
+      const int16_t totalH = static_cast<int16_t>(coverH * 2 + rowGap);
+      int16_t y = static_cast<int16_t>(body.y + (body.height - totalH) / 2);
+      drawRecentManualCell(s, 0, ui::Rect{x, y, coverW, coverH}, selectedSlot == 0);
+      y = static_cast<int16_t>(y + coverH + rowGap);
+      drawRecentManualCell(s, 1, ui::Rect{x, y, coverW, coverH}, selectedSlot == 1);
+    }
+    return;
+  }
   ui::CoverGridProps grid;
-  grid.itemProvider = libraryGridItem;
-  grid.count = static_cast<uint16_t>(shelf.count);
-  grid.topIndex = libraryTop;
-  grid.selectedIndex = librarySelected;
+  grid.itemProvider = recentGridItem;
+  grid.count = recentVisibleCount;
+  grid.topIndex = 0;
+  grid.selectedIndex = selectedSlot;
   grid.action = ActionOpenBook;
   grid.columns = columns;
-  grid.coverSize = {Shelf::kCoverW, Shelf::kCoverH};
+  grid.coverSize = {recentCoverW, recentCoverH};
   grid.rowHeight = rowHeight;
   grid.rowGap = rowGap;
   grid.gap = columnGap;
@@ -1333,40 +1704,84 @@ void libraryScreen(App::ScreenType& s, void*) {
   grid.selectedCoverFrameGap = 4;
   grid.selectedCoverFrameWidth = 2;
   grid.selectedCoverFrameRadius = 5;
-  grid.coverPainter = libraryCoverPainter;
+  grid.coverPainter = recentCoverPainter;
   grid.scrollIndicator = false;
   ui::coverGrid(s.frame(), body, grid);
+}
 
-  const uint16_t visibleRows = static_cast<uint16_t>(visible / columns);
-  const int16_t strideY = static_cast<int16_t>(rowHeight + rowGap);
-  const int16_t partialY = static_cast<int16_t>(body.y + visibleRows * strideY);
-  const int16_t partialH = static_cast<int16_t>(body.bottom() - partialY);
-  const uint16_t previewStart = static_cast<uint16_t>(libraryTop + visible);
-  if (partialH >= 24 && previewStart < shelf.count && visibleRows > 0) {
-    const int16_t cellW = static_cast<int16_t>((body.width - (columns - 1) * columnGap) / columns);
-    const int16_t previewH = partialH;
-    for (uint8_t col = 0; col < columns && previewStart + col < shelf.count; ++col) {
-      ui::Rect cell{static_cast<int16_t>(body.x + col * (cellW + columnGap)), partialY, cellW, previewH};
-      ui::Rect cover{static_cast<int16_t>(cell.x + (cell.width - Shelf::kCoverW) / 2), cell.y,
-                     Shelf::kCoverW, previewH};
-      drawLibraryCoverPreview(s.frame().target(), cover, static_cast<uint16_t>(previewStart + col));
+void drawAllBooksList(App::ScreenType& s) {
+  if (allBooksBrowserDirty) rebuildAllBooksBrowser();
+  if (allBooksEntryCount == 0) {
+    s.centeredText("No books found.\nCopy .epub files to /Books on the SD card.");
+    allBooksVisibleRows = 0;
+    return;
+  }
+  for (uint16_t i = 0; i < allBooksEntryCount; ++i) {
+    if (allBooksEntryKind[i] == BrowserEntryKind::Book) {
+      allBooksItems[i].icon = iconBook16();
+    } else {
+      allBooksItems[i].icon = iconFolder16();
     }
   }
-
-  if (shelf.count > visible && visible > 0) {
-    const int16_t trackW = 3;
-    const int16_t trackX = static_cast<int16_t>(gridBounds.right() - trackW);
-    s.frame().target().fill(ui::Rect{trackX, gridBounds.y, trackW, gridBounds.height},
-                            ui::Paint::dither(ui::Color::LightGray));
-    int16_t thumbH = static_cast<int16_t>((static_cast<int32_t>(gridBounds.height) * visible) / shelf.count);
-    if (thumbH < 18) thumbH = 18;
-    const uint16_t range = static_cast<uint16_t>(shelf.count - visible);
-    int16_t thumbY = static_cast<int16_t>(
-        gridBounds.y + (range > 0 ? (static_cast<int32_t>(gridBounds.height - thumbH) * libraryTop) / range : 0));
-    if (libraryTop >= range) thumbY = static_cast<int16_t>(gridBounds.bottom() - thumbH);
-    s.frame().target().fill(ui::Rect{trackX, thumbY, trackW, thumbH},
-                            ui::Paint::solid(ui::Color::Black));
+  ui::Rect listRect = s.body().inset({0, 2, 0, 12});
+  ui::ListProps list;
+  list.items = allBooksItems;
+  list.count = allBooksEntryCount;
+  list.selectedIndex = allBooksSelected;
+  list.action = ActionOpenBook;
+  list.topIndex = allBooksTop;
+  list.labelText = s.theme().bodyText;
+  list.subtitleText = s.theme().smallText;
+  list.rowStyles = ui::selectedPlainListRowStyles();
+  list.rowHeight = static_cast<int16_t>(s.target().lineHeight(list.labelText.font) +
+                                        s.target().lineHeight(list.subtitleText.font) + 22);
+  list.rowGap = 6;
+  list.rowRadius = 8;
+  list.sidePadding = 14;
+  list.iconSize = 24;
+  list.scrollIndicator = true;
+  list.partialTrailingRow = true;
+  list.partialTrailingMinHeight = s.target().lineHeight(list.labelText.font);
+  allBooksVisibleRows = ui::listVisibleRows(listRect, list.rowHeight, list.rowGap);
+  const uint16_t maxTop = allBooksEntryCount > allBooksVisibleRows
+                              ? static_cast<uint16_t>(allBooksEntryCount - allBooksVisibleRows)
+                              : 0;
+  if (allBooksTop > maxTop) allBooksTop = maxTop;
+  if (allBooksSelected < static_cast<int16_t>(allBooksTop) ||
+      allBooksSelected >= static_cast<int16_t>(allBooksTop + allBooksVisibleRows)) {
+    allBooksSelected = static_cast<int16_t>(allBooksTop);
   }
+  list.topIndex = allBooksTop;
+  ui::list(s.frame(), listRect, list);
+}
+
+void libraryScreen(App::ScreenType& s, void*) {
+  const uint16_t pct = battery.readPercentage();
+  if (libraryTab == LibraryTab::Settings) {
+    snprintf(statusText, sizeof(statusText), "Settings");
+  } else {
+    snprintf(statusText, sizeof(statusText), "%u books", static_cast<unsigned>(shelf.count));
+  }
+  char batteryMeta[12];
+  snprintf(batteryMeta, sizeof(batteryMeta), "%u%%", pct);
+  s.insetContent(ui::Insets{0, 10, 0, 12});
+  ui::Rect tabs = s.takeBottom(kLibraryTabHeight);
+
+  ui::HeaderProps h1;
+  h1.title = statusText;
+  h1.rightLabel = batteryMeta;
+  h1.titleOffsetY = -4;
+  h1.borderEdges = 0;  // borderless: it is a headline, not chrome
+  s.header(h1);
+  s.spacer(4);
+  if (libraryTab == LibraryTab::Recent) {
+    drawRecentGrid(s);
+  } else if (libraryTab == LibraryTab::AllBooks) {
+    drawAllBooksList(s);
+  } else {
+    drawSettingsContent(s, false);
+  }
+  drawLibraryTabs(s, tabs);
 }
 
 void drawFreeInkLogoDots(ui::DrawTarget& draw, const ui::Rect rect, const uint8_t phase,
@@ -1516,10 +1931,10 @@ void tocScreen(App::ScreenType& s, void*) {
   s.list(items, n, selected, ActionTocJump, tocTop);
 }
 
-void settingsScreen(App::ScreenType& s, void*) {
+void drawSettingsContent(App::ScreenType& s, bool withNavHeader) {
   char summary[20];
   snprintf(summary, sizeof(summary), "%d books", shelf.count);
-  s.navHeader("Settings", ActionBackToLibrary, ui::BitmapRef{}, nullptr, ui::EdgesNone);
+  if (withNavHeader) s.navHeader("Settings", ActionBackToLibrary, ui::BitmapRef{}, nullptr, ui::EdgesNone);
   s.insetContent({8, 12, 0, 12});
   if (libraryRefreshRequested) {
     s.centeredText("Scanning Library...\nChecking the SD card for books.");
@@ -1543,6 +1958,8 @@ void settingsScreen(App::ScreenType& s, void*) {
   uint16_t settingsRowIndex = 0;
   static constexpr int16_t kSettingsLeftInset = 14;
   static constexpr int16_t kSettingsRightInset = 26;
+  static constexpr int16_t kSettingsIconSize = 26;
+  static constexpr int16_t kSettingsTitleSubtitleGap = 4;
   auto takeSettingRect = [&]() {
     return s.takeTop(rowH, rowGap).inset({0, kSettingsRightInset, 0, kSettingsLeftInset});
   };
@@ -1555,7 +1972,8 @@ void settingsScreen(App::ScreenType& s, void*) {
       row.labelText = label;
       row.subtitleText = s.theme().smallText;
       row.icon = icon;
-      row.iconSize = 22;
+      row.iconSize = kSettingsIconSize;
+      row.titleSubtitleGap = kSettingsTitleSubtitleGap;
       ui::settingRow(s.frame(), takeSettingRect(), row);
     }
     ++settingsRowIndex;
@@ -1566,7 +1984,7 @@ void settingsScreen(App::ScreenType& s, void*) {
   refresh.subtitle = "Rescan the SD card for EPUB files";
   refresh.action = ActionRefreshLibrary;
   refresh.value = summary;
-  settingsRow(refresh, iconRefresh16());
+  settingsRow(refresh, settingIconForIndex(0));
 
   int16_t selected = -1;  // built-in
   for (int i = 0; i < fontShelf.count; ++i) {
@@ -1577,8 +1995,9 @@ void settingsScreen(App::ScreenType& s, void*) {
   font.label = "Selected Reading Font";
   font.subtitle = fontValue;
   font.subtitleText = s.theme().smallText;
-  font.icon = iconBook16();
-  font.iconSize = 22;
+  font.icon = settingIconForIndex(1);
+  font.iconSize = kSettingsIconSize;
+  font.titleSubtitleGap = kSettingsTitleSubtitleGap;
   font.action = ActionFontMenu;
   font.labelText = label;
   font.valueText = s.theme().bodyText;
@@ -1594,8 +2013,9 @@ void settingsScreen(App::ScreenType& s, void*) {
   size.label = "Reading Size";
   size.subtitle = sizeValue;
   size.subtitleText = s.theme().smallText;
-  size.icon = iconBook16();
-  size.iconSize = 22;
+  size.icon = settingIconForIndex(2);
+  size.iconSize = kSettingsIconSize;
+  size.titleSubtitleGap = kSettingsTitleSubtitleGap;
   size.action = ActionSizeMenu;
   size.labelText = label;
   size.valueText = s.theme().bodyText;
@@ -1609,8 +2029,9 @@ void settingsScreen(App::ScreenType& s, void*) {
   uiFont.label = "UI Font";
   uiFont.subtitle = uiFontName[0] ? uiFontName : "Built-in (Latin only)";
   uiFont.subtitleText = s.theme().smallText;
-  uiFont.icon = iconBook16();
-  uiFont.iconSize = 22;
+  uiFont.icon = settingIconForIndex(3);
+  uiFont.iconSize = kSettingsIconSize;
+  uiFont.titleSubtitleGap = kSettingsTitleSubtitleGap;
   uiFont.action = ActionUiFontMenu;
   uiFont.labelText = label;
   uiFont.valueText = s.theme().bodyText;
@@ -1624,13 +2045,14 @@ void settingsScreen(App::ScreenType& s, void*) {
   snprintf(lineValue, sizeof(lineValue), "%u%%", lineSpacingPct);
   snprintf(marginValue, sizeof(marginValue), "%u px", screenMarginPx);
   static const char* kAlignNames[4] = {"Justified", "Left", "Center", "Right"};
-  auto pickerRow = [&](const char* lbl, const char* val, ui::ActionId action) {
+  auto pickerRow = [&](const char* lbl, const char* val, ui::ActionId action, ui::BitmapRef icon) {
     ui::DropdownProps d;
     d.label = lbl;
     d.subtitle = val;
     d.subtitleText = s.theme().smallText;
-    d.icon = iconBook16();
-    d.iconSize = 22;
+    d.icon = icon;
+    d.iconSize = kSettingsIconSize;
+    d.titleSubtitleGap = kSettingsTitleSubtitleGap;
     d.action = action;
     d.labelText = label;
     d.styles = s.theme().button;
@@ -1639,25 +2061,83 @@ void settingsScreen(App::ScreenType& s, void*) {
     if (shouldDrawSetting()) ui::dropdown(s.frame(), takeSettingRect(), d);
     ++settingsRowIndex;
   };
-  pickerRow("Line Spacing", lineValue, ActionLineMenu);
-  pickerRow("Page Margin", marginValue, ActionMarginMenu);
-  pickerRow("Alignment", kAlignNames[paraAlign], ActionAlignMenu);
-  pickerRow("Orientation", kOrientNames[orientationSetting], ActionOrientMenu);
+  pickerRow("Line Spacing", lineValue, ActionLineMenu, settingIconForIndex(4));
+  pickerRow("Page Margin", marginValue, ActionMarginMenu, settingIconForIndex(5));
+  pickerRow("Alignment", kAlignNames[paraAlign], ActionAlignMenu, settingIconForIndex(6));
+  pickerRow("Orientation", kOrientNames[orientationSetting], ActionOrientMenu, settingIconForIndex(7));
 
-  auto toggle = [&](const char* lbl, bool on, ui::ActionId action) {
+  auto toggle = [&](const char* lbl, const char* subtitle, bool on, ui::ActionId action, ui::BitmapRef icon) {
     ui::ToggleRowProps t;
     t.row.label = lbl;
+    t.row.subtitle = subtitle;
     t.row.labelText = label;
+    t.row.subtitleText = s.theme().smallText;
+    t.row.icon = icon;
+    t.row.iconSize = kSettingsIconSize;
+    t.row.titleSubtitleGap = kSettingsTitleSubtitleGap;
     t.checked = on;
     t.toggleAction = action;
     if (shouldDrawSetting()) ui::toggleRow(s.frame(), takeSettingRect(), t);
     ++settingsRowIndex;
   };
-  toggle("Hyphenation", hyphenateSetting != 0, ActionToggleHyphen);
-  toggle("Sharp Text (no AA)", sharpText != 0, ActionToggleSharp);
-  toggle("Extra Paragraph Spacing", extraParaSpacing != 0, ActionToggleParaSpace);
-  toggle("Embedded Book Styles", embeddedStyles != 0, ActionToggleEmbCss);
-  toggle("Focus Reading", focusReading != 0, ActionToggleFocus);
+  toggle("Hyphenation", "Break long words", hyphenateSetting != 0,
+         ActionToggleHyphen, settingIconForIndex(8));
+  toggle("Sharp Text (no AA)", "Crisp one-bit text", sharpText != 0,
+         ActionToggleSharp, settingIconForIndex(9));
+  toggle("Extra Paragraph Spacing", "More paragraph space", extraParaSpacing != 0,
+         ActionToggleParaSpace, settingIconForIndex(10));
+  toggle("Embedded Book Styles", "Use publisher CSS", embeddedStyles != 0,
+         ActionToggleEmbCss, settingIconForIndex(11));
+  toggle("Focus Reading", "Bold word starts", focusReading != 0,
+         ActionToggleFocus, settingIconForIndex(12));
+
+  const uint16_t previewIndex = static_cast<uint16_t>(settingsTop + settingsVisibleRows);
+  const char* previewLabel = nullptr;
+  const char* previewSubtitle = nullptr;
+  switch (previewIndex) {
+    case 0: previewLabel = "Refresh Library"; break;
+    case 1: previewLabel = "Selected Reading Font"; break;
+    case 2: previewLabel = "Reading Size"; break;
+    case 3: previewLabel = "UI Font"; break;
+    case 4: previewLabel = "Line Spacing"; break;
+    case 5: previewLabel = "Page Margin"; break;
+    case 6: previewLabel = "Alignment"; break;
+    case 7: previewLabel = "Orientation"; break;
+    case 8:
+      previewLabel = "Hyphenation";
+      previewSubtitle = "Break long words";
+      break;
+    case 9:
+      previewLabel = "Sharp Text (no AA)";
+      previewSubtitle = "Crisp one-bit text";
+      break;
+    case 10:
+      previewLabel = "Extra Paragraph Spacing";
+      previewSubtitle = "More paragraph space";
+      break;
+    case 11:
+      previewLabel = "Embedded Book Styles";
+      previewSubtitle = "Use publisher CSS";
+      break;
+    case 12:
+      previewLabel = "Focus Reading";
+      previewSubtitle = "Bold word starts";
+      break;
+  }
+  const ui::Rect remaining = s.body();
+  if (previewLabel != nullptr && remaining.height >= s.target().lineHeight(label.font)) {
+    ui::SettingRowProps preview;
+    preview.label = previewLabel;
+    preview.subtitle = previewSubtitle;
+    preview.labelText = label;
+    preview.subtitleText = s.theme().smallText;
+    preview.icon = settingIconForIndex(previewIndex);
+    preview.iconSize = kSettingsIconSize;
+    preview.titleSubtitleGap = kSettingsTitleSubtitleGap;
+    preview.styles = s.theme().button;
+    preview.radius = 8;
+    ui::settingRow(s.frame(), remaining.inset({0, kSettingsRightInset, 0, kSettingsLeftInset}), preview);
+  }
 
   if (kSettingsRows > settingsVisibleRows) {
     const int16_t trackW = 3;
@@ -1794,7 +2274,6 @@ void goToPage(Screen next, bool initialPaint = false) {
     case Screen::Library: app->setScreen(libraryScreen, nullptr, ui::RefreshHint::None); break;
     case Screen::Reader: app->setScreen(readerScreen, nullptr, ui::RefreshHint::None); break;
     case Screen::Toc: app->setScreen(tocScreen, nullptr, ui::RefreshHint::None); break;
-    case Screen::Settings: app->setScreen(settingsScreen, nullptr, ui::RefreshHint::None); break;
     case Screen::Sleep: app->setScreen(sleepScreen, nullptr, ui::RefreshHint::None); break;
   }
   if (initialPaint) {
@@ -1834,7 +2313,9 @@ bool libraryNeedsPreloadWork() {
 }
 
 void scanAndPreloadLibrary() {
+  loadRecentHashes();
   shelf.scan();
+  rebuildRecentShelfSlots();
   const bool showLoading = libraryNeedsPreloadWork();
   if (showLoading) paintLoadingScreen(false);
   for (int i = 0; i < shelf.count; ++i) {
@@ -1842,6 +2323,8 @@ void scanAndPreloadLibrary() {
     shelf.ensureCover(static_cast<uint16_t>(i));
     if (showLoading) paintLoadingScreen(false);
   }
+  rebuildRecentShelfSlots();
+  allBooksBrowserDirty = true;
 }
 
 void showSleepScreenAndPowerOff() {
@@ -1856,16 +2339,24 @@ void showSleepScreenAndPowerOff() {
   PowerManager::deepSleepUntilPowerButton();
 }
 
+void scrollSettingsByRow(int8_t dir);
+
 void scrollLibraryByPage(int8_t dir) {
-  if (shelf.count <= libraryVisibleCells || libraryVisibleCells == 0) return;
-  const uint16_t step = libraryVisibleCells;
-  const uint16_t maxSelected = static_cast<uint16_t>(shelf.count - 1);
-  if (dir > 0) {
-    librarySelected = static_cast<int16_t>(
-        librarySelected + step > maxSelected ? maxSelected : librarySelected + step);
-  } else {
-    librarySelected = librarySelected > step ? static_cast<int16_t>(librarySelected - step) : 0;
+  if (libraryTab == LibraryTab::Settings) {
+    scrollSettingsByRow(dir);
+    return;
   }
+  if (libraryTab == LibraryTab::Recent) return;
+  if (allBooksBrowserDirty) rebuildAllBooksBrowser();
+  if (allBooksEntryCount <= allBooksVisibleRows || allBooksVisibleRows == 0) return;
+  const uint16_t step = allBooksVisibleRows > 1 ? static_cast<uint16_t>(allBooksVisibleRows - 1) : 1;
+  const uint16_t maxTop = static_cast<uint16_t>(allBooksEntryCount - allBooksVisibleRows);
+  if (dir > 0) {
+    allBooksTop = static_cast<uint16_t>(allBooksTop + step > maxTop ? maxTop : allBooksTop + step);
+  } else {
+    allBooksTop = allBooksTop > step ? static_cast<uint16_t>(allBooksTop - step) : 0;
+  }
+  allBooksSelected = static_cast<int16_t>(allBooksTop);
   app->invalidate(ui::RefreshHint::Fast);
 }
 
@@ -1902,8 +2393,32 @@ void scrollSettingsByRow(int8_t dir) {
 // Action handlers
 
 void onOpenBook(const ui::ActionEvent& e, void*) {
-  librarySelected = e.value;
-  if (session.begin(shelf.paths[e.value], fonts, (hyphReady && hyphenateSetting) ? &hyphenator : nullptr, bookBuf,
+  int16_t shelfIndex = e.value;
+  if (screen == Screen::Library && libraryTab == LibraryTab::AllBooks) {
+    if (allBooksBrowserDirty) rebuildAllBooksBrowser();
+    if (e.value < 0 || e.value >= static_cast<int16_t>(allBooksEntryCount)) return;
+    allBooksSelected = e.value;
+    const uint16_t row = static_cast<uint16_t>(e.value);
+    if (allBooksEntryKind[row] == BrowserEntryKind::Up || allBooksEntryKind[row] == BrowserEntryKind::Folder) {
+      char nextPath[160];
+      if (allBooksEntryKind[row] == BrowserEntryKind::Up) {
+        browserParentPath(nextPath, sizeof(nextPath));
+      } else {
+        browserJoinPath(allBooksPath, allBooksEntryNames[row], nextPath, sizeof(nextPath));
+      }
+      snprintf(allBooksPath, sizeof(allBooksPath), "%s", nextPath);
+      allBooksTop = 0;
+      allBooksSelected = 0;
+      allBooksBrowserDirty = true;
+      app->invalidate(ui::RefreshHint::Fast);
+      return;
+    }
+    shelfIndex = allBooksEntryShelfIndex[row];
+  }
+  if (shelfIndex < 0 || shelfIndex >= shelf.count) return;
+  librarySelected = shelfIndex;
+  promoteRecentBook(static_cast<uint16_t>(shelfIndex));
+  if (session.begin(shelf.paths[shelfIndex], fonts, (hyphReady && hyphenateSetting) ? &hyphenator : nullptr, bookBuf,
                     512 * 1024, scratchBuf, 512 * 1024, indexBuf, 64 * 1024)) {
     readerChromeVisible = false;
     tocTop = 0;
@@ -1951,10 +2466,13 @@ void onFontSize(const ui::ActionEvent&, void*) {
   app->invalidate(ui::RefreshHint::Full);
 }
 
-void onSettings(const ui::ActionEvent&, void*) {
-  fontShelf.scan();
-  settingsTop = 0;
-  goToPage(Screen::Settings);
+void onLibraryTab(const ui::ActionEvent& e, void*) {
+  libraryTab = static_cast<LibraryTab>(e.value);
+  settingsMenu = 0;
+  if (libraryTab == LibraryTab::Settings) {
+    fontShelf.scan();
+  }
+  app->invalidate(ui::RefreshHint::Fast);
 }
 
 void onRefreshLibrary(const ui::ActionEvent&, void*) {
@@ -2036,10 +2554,6 @@ void onPickSize(const ui::ActionEvent& e, void*) {
 }
 
 void onBackToLibrary(const ui::ActionEvent&, void*) {
-  if (screen == Screen::Settings) {
-    goToPage(Screen::Library);
-    return;
-  }
   session.end();
   goToPage(Screen::Library);
 }
@@ -2089,7 +2603,7 @@ void setup() {
   scratchBuf = psAlloc(512 * 1024);
   indexBuf = psAlloc(64 * 1024);
   glyphBuf = psAlloc(128 * 1024);
-  coverBookBuf = psAlloc(128 * 1024);
+  coverBookBuf = psAlloc(512 * 1024);  // omnibus ZIP catalogs need the same room as reading
   coverScratchBuf = psAlloc(192 * 1024);
 
   app->on(ActionOpenBook, onOpenBook);
@@ -2099,7 +2613,7 @@ void setup() {
   app->on(ActionToc, onCenterTap);
   app->on(ActionTocJump, onTocJump);
   app->on(ActionFontSize, onFontSize);
-  app->on(ActionSettings, onSettings);
+  app->on(ActionLibraryTab, onLibraryTab);
   app->on(ActionPickFont, onPickFont);
   app->on(ActionPickSize, onPickSize);
   app->on(ActionFontMenu, onFontMenu);
@@ -2147,6 +2661,7 @@ void setup() {
   // lines from stretching into word-gap canyons.
   if (!hyphReady) hyphReady = hyphenator.init(book::k_hyph_en_us, book::k_hyph_en_us_size);
 
+  LOGF("[freeink-books] build " __DATE__ " " __TIME__ " engine: %s\n", book::vendorVersions());
   LOGF("[freeink-books] sd=%d books=%d font=%s\n", SdMan.ready() ? 1 : 0, shelf.count,
        currentFontName[0] ? currentFontName : "(built-in)");
 }
@@ -2187,10 +2702,6 @@ void loop() {
       }
       if (screen == Screen::Toc) {
         scrollTocByPage(dir);
-        continue;
-      }
-      if (screen == Screen::Settings) {
-        scrollSettingsByRow(dir);
         continue;
       }
     }
@@ -2234,15 +2745,18 @@ void loop() {
         break;
       }
     } else if (screen == Screen::Library && verticalSwipe && dy != 0) {
-      if (shelf.count > libraryVisibleCells && libraryVisibleCells > 0) {
-        const uint16_t step = libraryVisibleCells;
-        const uint16_t maxSelected = static_cast<uint16_t>(shelf.count - 1);
+      if (libraryTab == LibraryTab::Settings && settingsMenu == 0) {
+        scrollSettingsByRow(dy < 0 ? 1 : -1);
+      } else if (libraryTab == LibraryTab::AllBooks &&
+                 allBooksEntryCount > allBooksVisibleRows && allBooksVisibleRows > 0) {
+        const uint16_t step = allBooksVisibleRows > 1 ? static_cast<uint16_t>(allBooksVisibleRows - 1) : 1;
+        const uint16_t maxTop = static_cast<uint16_t>(allBooksEntryCount - allBooksVisibleRows);
         if (dy < 0) {
-          librarySelected = static_cast<int16_t>(
-              librarySelected + step > maxSelected ? maxSelected : librarySelected + step);
+          allBooksTop = static_cast<uint16_t>(allBooksTop + step > maxTop ? maxTop : allBooksTop + step);
         } else {
-          librarySelected = librarySelected > step ? static_cast<int16_t>(librarySelected - step) : 0;
+          allBooksTop = allBooksTop > step ? static_cast<uint16_t>(allBooksTop - step) : 0;
         }
+        allBooksSelected = static_cast<int16_t>(allBooksTop);
         app->invalidate(ui::RefreshHint::Fast);
       }
     } else if (screen == Screen::Toc && dy != 0) {
@@ -2257,17 +2771,6 @@ void loop() {
           tocTop = static_cast<uint16_t>(tocTop + step > maxTop ? maxTop : tocTop + step);
         } else {
           tocTop = tocTop > step ? static_cast<uint16_t>(tocTop - step) : 0;
-        }
-        app->invalidate(ui::RefreshHint::Fast);
-      }
-    } else if (screen == Screen::Settings && settingsMenu == 0 && dy != 0) {
-      static constexpr uint16_t kSettingsRows = 13;
-      if (kSettingsRows > settingsVisibleRows && settingsVisibleRows > 0) {
-        const uint16_t maxTop = static_cast<uint16_t>(kSettingsRows - settingsVisibleRows);
-        if (dy < 0) {
-          settingsTop = settingsTop < maxTop ? static_cast<uint16_t>(settingsTop + 1) : maxTop;
-        } else {
-          settingsTop = settingsTop > 0 ? static_cast<uint16_t>(settingsTop - 1) : 0;
         }
         app->invalidate(ui::RefreshHint::Fast);
       }
@@ -2334,6 +2837,9 @@ void loop() {
       librarySelected = shelf.count > 0 ? static_cast<int16_t>(shelf.count - 1) : 0;
     }
     libraryTop = 0;
+    allBooksTop = 0;
+    allBooksSelected = 0;
+    allBooksBrowserDirty = true;
     libraryRefreshRequested = false;
     libraryRefreshPainted = false;
     goToPage(Screen::Library, /*initialPaint=*/true);
