@@ -1,4 +1,4 @@
-# freeink-books
+# freeink-reader
 
 An EPUB reader for the Seeed reTerminal Sticky, built entirely on the
 [FreeInk SDK](https://github.com/Free-Ink/freeink-sdk): FreeInkBook does the

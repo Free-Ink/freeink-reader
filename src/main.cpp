@@ -1,4 +1,4 @@
-// freeink-books — EPUB reader for the Seeed reTerminal Sticky.
+// freeink-reader — EPUB reader for the Seeed reTerminal Sticky.
 //
 // Everything heavy is SDK code: FreeInkBook parses/paginates/caches/renders
 // books; FreeInkUI draws the chrome and routes input; the board libraries own
@@ -34,16 +34,6 @@
 #include "BookStorageAdapters.h"
 #include "icons_gen.h"
 #include <FreeInkUIIcon.h>
-
-// Sticky logs reliably through the IDF/ROM console (USB-Serial/JTAG), not the
-// Arduino CDC Serial object — BoardConfig.h encodes this per board as
-// FREEINK_LOG_TRANSPORT. X3/X4-class boards keep plain Serial.
-#if FREEINK_LOG_TRANSPORT == FREEINK_LOG_TRANSPORT_ROM_PRINTF
-#include <esp_rom_sys.h>
-#define LOGF(...) esp_rom_printf(__VA_ARGS__)
-#else
-#define LOGF(...) Serial.printf(__VA_ARGS__)
-#endif
 
 using namespace freeink;
 using book::BookStatus;
@@ -360,23 +350,11 @@ struct ReaderSession {
     book::Page page{};
     const BookStatus rs = reader.readPage(pageInChapter, scratch, &page);
     if (rs != BookStatus::Ok) {
-      LOGF("[reader] readPage(%u) %s\n", pageInChapter, book::bookStatusName(rs));
       scratch.release(marked);
       return false;
     }
-    LOGF("[reader] page %u ok: runs=%u images=%u char=%u\n", pageInChapter, page.runCount,
-         page.imageCount, page.charStart);
-    uint32_t missingCp = 0;
-    const uint32_t missing = book::PageRenderer::renderText(page, fonts, target, &missingCp);
-    if (missing != 0) {
-      LOGF("[reader] %u glyphs missing on page %u (first U+%04X)\n", missing, pageInChapter,
-           missingCp);
-    }
-    const BookStatus is = book::PageRenderer::renderImages(page, source, bk.zip(), scratch, target);
-    if (is != BookStatus::Ok) {
-      LOGF("[reader] images on page %u: %s (%u placed)\n", pageInChapter,
-           book::bookStatusName(is), page.imageCount);
-    }
+    book::PageRenderer::renderText(page, fonts, target, nullptr);
+    book::PageRenderer::renderImages(page, source, bk.zip(), scratch, target);
     pos.charStart = page.charStart;
     scratch.release(marked);
     return true;
@@ -566,8 +544,6 @@ Screen screen = Screen::Library;
 enum class LibraryTab : uint8_t { Recent = 0, AllBooks = 1, Settings = 2 };
 LibraryTab libraryTab = LibraryTab::Recent;
 int16_t librarySelected = 0;
-uint16_t libraryTop = 0;
-uint16_t libraryVisibleCells = 0;
 uint16_t allBooksTop = 0;
 uint16_t allBooksVisibleRows = 0;
 static constexpr uint16_t kAllBooksMaxRows = 48;
@@ -595,9 +571,6 @@ bool readerChromeVisible = false;
 bool libraryRefreshRequested = false;
 bool libraryRefreshPainted = false;
 int16_t pendingOpenShelfIndex = -1;
-bool pendingOpenToastVisible = false;
-bool pendingOpenToastPresented = false;
-uint32_t pendingOpenToastShownAt = 0;
 char statusText[96];
 uint8_t loadingPhase = 0;
 bool ignorePowerUntilRelease = true;
@@ -1061,7 +1034,6 @@ void Shelf::ensureDetails(uint16_t index) {
 
   SdBookSource source;
   if (!source.open(paths[index])) {
-    LOGF("[cover] %s: SD open FAILED\n", paths[index]);
     return;
   }
 
@@ -1071,9 +1043,6 @@ void Shelf::ensureDetails(uint16_t index) {
   scratch.init(coverScratchBuf, 192 * 1024);
   book::Book bk;
   const BookStatus openStatus = bk.open(source, bookArena, scratch);
-  if (openStatus != BookStatus::Ok) {
-    LOGF("[cover] %s: book open %s\n", paths[index], book::bookStatusName(openStatus));
-  }
   if (openStatus == BookStatus::Ok) {
     if (bk.metadata().title != nullptr && bk.metadata().title[0] != 0) {
       snprintf(titles[index], sizeof(titles[index]), "%s", bk.metadata().title);
@@ -1084,8 +1053,6 @@ void Shelf::ensureDetails(uint16_t index) {
     const book::ManifestItem* cover = chooseCoverItem(bk);
     if (cover != nullptr && cover->href != nullptr) {
       snprintf(coverHrefs[index], sizeof(coverHrefs[index]), "%s", cover->href);
-    } else {
-      LOGF("[cover] %s: no cover item in manifest\n", paths[index]);
     }
     snprintf(metas[index], sizeof(metas[index]), "%u chapters",
              static_cast<unsigned>(bk.spineCount()));
@@ -1157,14 +1124,7 @@ bool Shelf::ensureCover(uint16_t index) {
       const BookStatus rs =
           book::ImageRenderer::render(source, bk.zip(), image, scratch, coverDecodeRow, &ctx);
       ok = rs == BookStatus::Ok;
-      if (!ok) {
-        LOGF("[cover] %s: render %s (probe kind=%d %ux%u prog=%d)\n", coverHrefs[index],
-             book::bookStatusName(rs), (int)info.kind, info.width, info.height,
-             (int)info.progressive);
-      }
       scratch.release(mark);
-    } else {
-      LOGF("[cover] %s: zip entry not found\n", coverHrefs[index]);
     }
   }
   source.close();
@@ -1186,10 +1146,6 @@ ui::CoverGridItem Shelf::gridItem(uint16_t index, bool loadDetails) {
   item.actionValue = static_cast<int16_t>(index);
   item.enabled = index < count;
   return item;
-}
-
-ui::CoverGridItem libraryGridItem(uint16_t index, void*) {
-  return shelf.gridItem(index);
 }
 
 ui::CoverGridItem recentGridItem(uint16_t index, void*) {
@@ -1514,19 +1470,16 @@ void loadFontSetting() {
 
 // Loads one TTF from /fonts into PSRAM and initializes the engine.
 // Loads one face file into its own PSRAM buffer + glyph arena.
-bool loadFaceFile(const char* name, book::TtfFont& face, uint8_t*& buf, uint32_t& cap,
-                  bool quiet) {
+bool loadFaceFile(const char* name, book::TtfFont& face, uint8_t*& buf, uint32_t& cap) {
   char path[96];
   snprintf(path, sizeof(path), "/fonts/%s", name);
   FsFile f = SdMan.open(path, O_RDONLY);
   if (!f) {
-    if (!quiet) LOGF("[font] open failed: %s\n", path);
     return false;
   }
   const uint32_t len = f.fileSize();
   // Size the buffer to the font (variable fonts run 4-5 MB); PSRAM has room.
   if (len > 6 * 1024 * 1024) {
-    LOGF("[font] %s too large (%u bytes, cap 6MB)\n", name, len);
     f.close();
     return false;
   }
@@ -1536,14 +1489,12 @@ bool loadFaceFile(const char* name, book::TtfFont& face, uint8_t*& buf, uint32_t
     cap = buf != nullptr ? len : 0;
   }
   if (buf == nullptr) {
-    LOGF("[font] %u-byte alloc failed (free PSRAM %u)\n", len, ESP.getFreePsram());
     f.close();
     return false;
   }
   const int got = f.read(buf, len);
   f.close();
   if (got != static_cast<int>(len)) {
-    LOGF("[font] short read %d/%u for %s\n", got, len, name);
     return false;
   }
   uint8_t* arena = psAlloc(64 * 1024);
@@ -1552,12 +1503,10 @@ bool loadFaceFile(const char* name, book::TtfFont& face, uint8_t*& buf, uint32_t
   static uint8_t arenaUsed = 0;
   book::Arena& glyphArena = arenas[arenaUsed++ & 3];
   glyphArena.init(arena, 64 * 1024);
-  const bool ok = face.init(buf, len, glyphArena);
-  if (!ok) LOGF("[font] %s failed to parse (AppleDouble junk? not a TTF?)\n", name);
-  return ok;
+  return face.init(buf, len, glyphArena);
 }
 
-bool tryLoadTtf(const char* name) { return loadFaceFile(name, ttf, fontFile, fontFileCap, false); }
+bool tryLoadTtf(const char* name) { return loadFaceFile(name, ttf, fontFile, fontFileCap); }
 
 // Tries "<stem>-Bold.ttf" style siblings of the regular face.
 void loadVariantFaces(const char* regularName) {
@@ -1582,9 +1531,8 @@ void loadVariantFaces(const char* regularName) {
   for (int v = 0; v < 3; ++v) {
     char name[96];
     snprintf(name, sizeof(name), "%s%s.ttf", stem, variants[v].suffix);
-    if (loadFaceFile(name, *variants[v].face, bufs[v], caps[v], true)) {
+    if (loadFaceFile(name, *variants[v].face, bufs[v], caps[v])) {
       fonts.add(variants[v].face, variants[v].flags);
-      LOGF("[font] +%s\n", name);
     }
   }
 }
@@ -1610,7 +1558,6 @@ void applyFont() {
     }
   }
   fonts.add(&builtinFont);
-  LOGF("[font] active: %s\n", fontReady ? currentFontName : "built-in Noto Sans");
 }
 
 // UI chrome fallback font: bitmap Noto covers Latin; a chosen TTF supplies
@@ -1621,13 +1568,11 @@ void applyOrientation() {
 }
 
 void applyUiFont() {
-  if (uiFontName[0] != 0 && loadFaceFile(uiFontName, uiTtf, uiFontBuf, uiFontCap, false)) {
+  if (uiFontName[0] != 0 && loadFaceFile(uiFontName, uiTtf, uiFontBuf, uiFontCap)) {
     uiGlyphSource.setFont(&uiTtf);
     target->setGlyphFallback(&uiGlyphSource);
-    LOGF("[font] ui fallback: %s\n", uiFontName);
   } else {
     target->setGlyphFallback(nullptr);
-    if (uiFontName[0] != 0) LOGF("[font] ui fallback %s failed\n", uiFontName);
   }
 }
 
@@ -1671,7 +1616,6 @@ void drawLibraryTabs(App::ScreenType& s, ui::Rect rect) {
 void drawRecentGrid(App::ScreenType& s) {
   if (shelf.count == 0) {
     s.centeredText("No books found.\nCopy .epub files to /Books on the SD card.");
-    libraryVisibleCells = 0;
     return;
   }
   const ui::Rect gridBounds = s.body();
@@ -1699,8 +1643,6 @@ void drawRecentGrid(App::ScreenType& s) {
       body.height = gridH;
     }
   }
-  const uint16_t visible = ui::coverGridVisibleCells(body, columns, rowHeight, rowGap);
-  libraryVisibleCells = visible;
   int16_t selectedSlot = -1;
   for (uint8_t i = 0; i < recentVisibleCount; ++i) {
     if (recentShelfForSlot[i] == librarySelected) {
@@ -1709,7 +1651,6 @@ void drawRecentGrid(App::ScreenType& s) {
     }
   }
   if (selectedSlot < 0 && recentVisibleCount > 0) selectedSlot = 0;
-  libraryTop = 0;
   if (recentVisibleCount <= 2) {
     const int16_t singleCoverH = recentVisibleCount == 1
                                      ? recentCoverH
@@ -1970,9 +1911,6 @@ void tocScreen(App::ScreenType& s, void*) {
   s.navHeader("Contents", ActionBackToReader, ui::BitmapRef{}, nullptr, ui::EdgesNone);
   s.insetContent({8, 12, 0, 12});
   tocVisibleRows = ui::listVisibleRows(s.body(), s.theme().rowHeight, 0);
-  LOGF("[toc] open=%d n=%u visible=%u rowH=%d body=%dx%d first='%s'\n", session.open ? 1 : 0,
-       n, tocVisibleRows, s.theme().rowHeight, s.body().width, s.body().height,
-       n > 0 ? items[0].label : "-");
   tocTop = ui::listTopIndexFor(tocAnchorSelected ? selected : -1, tocTop, tocVisibleRows, n);
   tocAnchorSelected = false;
   s.list(items, n, selected, ActionTocJump, tocTop);
@@ -2380,8 +2318,6 @@ bool presentIndexingToast() {
 void performPendingOpen() {
   const int16_t shelfIndex = pendingOpenShelfIndex;
   pendingOpenShelfIndex = -1;
-  pendingOpenToastVisible = false;
-  pendingOpenToastPresented = false;
   if (shelfIndex < 0 || shelfIndex >= shelf.count) {
     app->invalidate(ui::RefreshHint::Full);
     return;
@@ -2514,9 +2450,6 @@ void onOpenBook(const ui::ActionEvent& e, void*) {
   if (shelfIndex < 0 || shelfIndex >= shelf.count) return;
   librarySelected = shelfIndex;
   pendingOpenShelfIndex = shelfIndex;
-  pendingOpenToastVisible = true;
-  pendingOpenToastPresented = false;
-  pendingOpenToastShownAt = 0;
   app->clearTapFlash();
   app->invalidate(ui::RefreshHint::Fast);
 }
@@ -2663,11 +2596,6 @@ void setup() {
   BoardConfig::releaseSdRail();
   delay(10);
 
-  delay(250);  // let USB-Serial/JTAG power up before CDC begin
-  Serial.begin(115200);
-  Serial.setTxTimeoutMs(1);  // never block when no host is reading
-  LOGF("[freeink-books] boot (psram %u KB)\n", ESP.getPsramSize() / 1024);
-
   // SD before display: they share the SPI bus, and SDCardManager::begin()
   // expects to probe the card before the display driver claims the bus (it
   // deselects the panel CS itself for exactly this window).
@@ -2756,9 +2684,6 @@ void setup() {
   // lines from stretching into word-gap canyons.
   if (!hyphReady) hyphReady = hyphenator.init(book::k_hyph_en_us, book::k_hyph_en_us_size);
 
-  LOGF("[freeink-books] build " __DATE__ " " __TIME__ " engine: %s\n", book::vendorVersions());
-  LOGF("[freeink-books] sd=%d books=%d font=%s\n", SdMan.ready() ? 1 : 0, shelf.count,
-       currentFontName[0] ? currentFontName : "(built-in)");
 }
 
 void loop() {
@@ -2896,18 +2821,11 @@ void loop() {
   }
 
   static ui::RefreshHint pending = ui::RefreshHint::None;
-  if (pendingOpenShelfIndex >= 0 && pendingOpenToastVisible && !pendingOpenToastPresented) {
+  if (pendingOpenShelfIndex >= 0) {
     if (presentIndexingToast()) {
-      pendingOpenToastPresented = true;
-      pendingOpenToastShownAt = millis();
       pending = ui::RefreshHint::None;
       performPendingOpen();
     }
-  }
-
-  if (pendingOpenShelfIndex >= 0 && pendingOpenToastPresented && !display.refreshBusy() &&
-      millis() - pendingOpenToastShownAt >= 80) {
-    performPendingOpen();
   }
 
   if (app->invalidated() && pendingOpenShelfIndex < 0) {
@@ -2921,10 +2839,7 @@ void loop() {
                                        sharpText ? freeink::book::FrameFormat::Mono1Sharp
                                                  : freeink::book::FrameFormat::Mono1Dithered,
                                        kPageRot[orientationSetting]};
-      if (!session.renderCurrent(fonts, frame)) {
-        LOGF("[reader] page %u/%u render FAILED (ch %u)\n", session.pageInChapter + 1,
-             session.reader.pageCount(), session.pos.spineIndex);
-      }
+      session.renderCurrent(fonts, frame);
     }
     const ui::RefreshHint hint = app->lastRenderRefreshHint();
     if (static_cast<uint8_t>(hint) > static_cast<uint8_t>(pending)) pending = hint;
@@ -2945,7 +2860,6 @@ void loop() {
     if (librarySelected >= shelf.count) {
       librarySelected = shelf.count > 0 ? static_cast<int16_t>(shelf.count - 1) : 0;
     }
-    libraryTop = 0;
     allBooksTop = 0;
     allBooksSelected = 0;
     allBooksBrowserDirty = true;

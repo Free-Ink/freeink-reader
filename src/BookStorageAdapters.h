@@ -1,6 +1,6 @@
 #pragma once
 
-// freeink-books — SD-card adapters binding FreeInkBook's storage interfaces
+// freeink-reader — SD-card adapters binding FreeInkBook's storage interfaces
 // to SDCardManager/SdFat. Everything else in the reader is SDK code.
 
 #include <BookStorage.h>
