@@ -120,7 +120,8 @@ bool isCrashReportName(const char* name) {
 bool isHiddenOrSystemDir(const char* name) {
   if (name == nullptr || name[0] == 0 || name[0] == '.') return true;
   return strcasecmp(name, "BookCache") == 0 || strcasecmp(name, "System Volume Information") == 0 ||
-         strcasecmp(name, "fonts") == 0;
+         strcasecmp(name, "fonts") == 0 || strcasecmp(name, "sleep") == 0 ||
+         strcasecmp(name, "screenshots") == 0 || strcasecmp(name, "themes") == 0;
 }
 
 struct Shelf {
@@ -215,6 +216,7 @@ struct Progress {  // persisted per book: (spineIndex, charStart, baseSizePx)
   uint16_t spineIndex = 0;
   uint32_t charStart = 0;
   uint16_t baseSizePx = 18;
+  uint8_t percent = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -481,6 +483,17 @@ struct ReaderSession {
     if (pos.baseSizePx < 12 || pos.baseSizePx > 32) pos.baseSizePx = 18;
   }
   void saveProgress() {
+    if (open) {
+      const uint32_t chapters = isTxt ? 1 : static_cast<uint32_t>(bk.spineCount());
+      const uint32_t pages = reader.pageCount() > 0 ? reader.pageCount() : 1;
+      uint32_t pct = chapters > 0
+                         ? (static_cast<uint32_t>(pos.spineIndex) * 100u +
+                            (static_cast<uint32_t>(pageInChapter) * 100u) / pages) /
+                               chapters
+                         : 0;
+      if (pct > 100) pct = 100;
+      pos.percent = static_cast<uint8_t>(pct);
+    }
     FsFile f = SdMan.open(progressPath, O_WRONLY | O_CREAT | O_TRUNC);
     if (f) {
       f.write(&pos, sizeof(pos));
@@ -561,6 +574,7 @@ static constexpr uint16_t kAllBooksMaxRows = 48;
 enum class BrowserEntryKind : uint8_t { Up, Folder, Book };
 char allBooksPath[160] = "/";
 char allBooksEntryNames[kAllBooksMaxRows][64];
+char allBooksEntrySubtitles[kAllBooksMaxRows][48];
 int16_t allBooksEntryShelfIndex[kAllBooksMaxRows];
 BrowserEntryKind allBooksEntryKind[kAllBooksMaxRows];
 ui::ListItem allBooksItems[kAllBooksMaxRows];
@@ -779,12 +793,38 @@ void addBrowserEntry(BrowserEntryKind kind, const char* label, const char* subti
   if (allBooksEntryCount >= kAllBooksMaxRows) return;
   const uint16_t i = allBooksEntryCount++;
   snprintf(allBooksEntryNames[i], sizeof(allBooksEntryNames[i]), "%s", label != nullptr ? label : "");
+  snprintf(allBooksEntrySubtitles[i], sizeof(allBooksEntrySubtitles[i]), "%s",
+           subtitle != nullptr ? subtitle : "");
   allBooksEntryShelfIndex[i] = shelfIndex;
   allBooksEntryKind[i] = kind;
   allBooksItems[i] = ui::ListItem{};
   allBooksItems[i].label = allBooksEntryNames[i];
-  allBooksItems[i].subtitle = subtitle;
+  allBooksItems[i].subtitle = allBooksEntrySubtitles[i][0] ? allBooksEntrySubtitles[i] : nullptr;
   allBooksItems[i].actionValue = static_cast<int16_t>(i);
+}
+
+uint8_t savedProgressPercentForShelf(uint16_t shelfIndex) {
+  if (shelfIndex >= shelf.count) return 0;
+  char path[128];
+  snprintf(path, sizeof(path), "/BookCache/%08x/progress.bin",
+           static_cast<unsigned>(shelfPathHash(shelf.paths[shelfIndex])));
+  FsFile f = SdMan.open(path, O_RDONLY);
+  if (!f) return 0;
+  Progress p{};
+  const int n = f.read(&p, sizeof(p));
+  f.close();
+  if (n < static_cast<int>(sizeof(uint16_t) + sizeof(uint32_t) + sizeof(uint16_t) + sizeof(uint8_t))) return 0;
+  return p.percent <= 100 ? p.percent : 0;
+}
+
+void bookListSubtitle(uint16_t shelfIndex, char* out, size_t outLen) {
+  if (out == nullptr || outLen == 0) return;
+  const uint8_t pct = savedProgressPercentForShelf(shelfIndex);
+  if (shelfIndex < shelf.count && shelf.authors[shelfIndex][0]) {
+    snprintf(out, outLen, "%u%% - %s", static_cast<unsigned>(pct), shelf.authors[shelfIndex]);
+  } else {
+    snprintf(out, outLen, "%u%%", static_cast<unsigned>(pct));
+  }
 }
 
 void rebuildAllBooksBrowser() {
@@ -832,10 +872,9 @@ void rebuildAllBooksBrowser() {
     browserJoinPath(allBooksPath, name, path, sizeof(path));
     const int16_t shelfIndex = shelfIndexForPath(path);
     if (shelfIndex < 0) continue;
-    shelf.ensureDetails(static_cast<uint16_t>(shelfIndex));
-    addBrowserEntry(BrowserEntryKind::Book, shelf.titles[shelfIndex],
-                    shelf.authors[shelfIndex][0] ? shelf.authors[shelfIndex] : shelf.metas[shelfIndex],
-                    shelfIndex);
+    char subtitle[48];
+    bookListSubtitle(static_cast<uint16_t>(shelfIndex), subtitle, sizeof(subtitle));
+    addBrowserEntry(BrowserEntryKind::Book, shelf.titles[shelfIndex], subtitle, shelfIndex);
   }
   dir.close();
 
@@ -2306,8 +2345,10 @@ void paintLoadingScreen(const bool waitForRefresh = true) {
 }
 
 bool libraryNeedsPreloadWork() {
-  for (int i = 0; i < shelf.count; ++i) {
-    if (!shelf.detailsReady[i] || !shelf.coverTried[i]) return true;
+  for (uint8_t i = 0; i < recentVisibleCount; ++i) {
+    const int16_t shelfIndex = recentShelfForSlot[i];
+    if (shelfIndex < 0 || shelfIndex >= shelf.count) continue;
+    if (!shelf.detailsReady[shelfIndex] || !shelf.coverTried[shelfIndex]) return true;
   }
   return false;
 }
@@ -2318,9 +2359,11 @@ void scanAndPreloadLibrary() {
   rebuildRecentShelfSlots();
   const bool showLoading = libraryNeedsPreloadWork();
   if (showLoading) paintLoadingScreen(false);
-  for (int i = 0; i < shelf.count; ++i) {
-    shelf.ensureDetails(static_cast<uint16_t>(i));
-    shelf.ensureCover(static_cast<uint16_t>(i));
+  for (uint8_t i = 0; i < recentVisibleCount; ++i) {
+    const int16_t shelfIndex = recentShelfForSlot[i];
+    if (shelfIndex < 0 || shelfIndex >= shelf.count) continue;
+    shelf.ensureDetails(static_cast<uint16_t>(shelfIndex));
+    shelf.ensureCover(static_cast<uint16_t>(shelfIndex));
     if (showLoading) paintLoadingScreen(false);
   }
   rebuildRecentShelfSlots();
