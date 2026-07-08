@@ -82,9 +82,10 @@ enum : ui::ActionId {
   ActionPickOrient,
   ActionCloseMenu,
   ActionRefreshLibrary,
+  ActionLibraryTab,
 };
 
-enum class Screen : uint8_t { Library, Reader, Toc, Settings };
+enum class Screen : uint8_t { Boot, Library, Reader, Toc, Settings, Sleep };
 
 // ---------------------------------------------------------------------------
 // Stores
@@ -120,6 +121,8 @@ struct Shelf {
   int count = 0;
 
   void scan() {
+    SdMan.ensureDirectoryExists("/BookCache");
+    SdMan.ensureDirectoryExists("/BookCache/shelf");
     releaseCovers();
     count = 0;
     addFrom("/");       // books anywhere: card root works out of the box
@@ -155,14 +158,18 @@ struct Shelf {
       snprintf(metas[count], sizeof(metas[count]), "%s", dir);
       items[count] = ui::ListItem{};
       items[count].label = titles[count];
+      items[count].subtitle = metas[count];
       items[count].actionValue = static_cast<int16_t>(count);
       coverBits[count] = nullptr;
       detailsReady[count] = false;
       coverTried[count] = false;
+      loadCachedEntry(static_cast<uint16_t>(count));
       ++count;
     }
   }
 
+  bool loadCachedEntry(uint16_t index);
+  void saveCachedEntry(uint16_t index);
   void ensureDetails(uint16_t index);
   bool ensureCover(uint16_t index);
   ui::CoverGridItem gridItem(uint16_t index, bool loadDetails = true);
@@ -507,11 +514,13 @@ bool hyphReady = false;
 bool fontReady = false;
 
 Screen screen = Screen::Library;
+enum class LibraryTab : uint8_t { Recent = 0, AllBooks = 1, Settings = 2 };
+LibraryTab libraryTab = LibraryTab::Recent;
 int16_t librarySelected = 0;
 uint16_t libraryTop = 0;
 uint16_t libraryVisibleCells = 0;
-bool libraryFastScrollFrame = false;
-bool libraryHydrateAfterScroll = false;
+uint16_t allBooksTop = 0;
+uint16_t allBooksVisibleRows = 0;
 uint16_t tocTop = 0;
 uint16_t tocVisibleRows = 0;
 bool tocAnchorSelected = false;
@@ -521,6 +530,8 @@ bool readerChromeVisible = false;
 bool libraryRefreshRequested = false;
 bool libraryRefreshPainted = false;
 char statusText[96];
+uint8_t loadingPhase = 0;
+bool ignorePowerUntilRelease = true;
 
 uint8_t* bookBuf = nullptr;      // 256 KB PSRAM
 uint8_t* scratchBuf = nullptr;   // 512 KB PSRAM
@@ -564,6 +575,80 @@ bool isSupportedCoverImage(const book::ManifestItem* item) {
          strcmp(item->mediaType, "image/jpg") == 0;
 }
 
+struct ShelfCacheHeader {
+  uint32_t magic = 0;
+  uint16_t version = 0;
+  uint16_t headerSize = 0;
+  uint32_t pathHash = 0;
+  uint32_t sampleHash = 0;
+  uint64_t fileSize = 0;
+  uint16_t coverW = 0;
+  uint16_t coverH = 0;
+  uint16_t coverStride = 0;
+  uint16_t coverBytes = 0;
+  uint8_t hasCover = 0;
+  uint8_t coverTried = 0;
+  char title[64];
+  char author[48];
+  char meta[48];
+  char coverHref[160];
+};
+
+static constexpr uint32_t kShelfCacheMagic = 0x46425348;  // FBSH
+static constexpr uint16_t kShelfCacheVersion = 2;
+
+uint32_t shelfPathHash(const char* path) {
+  return book::ZipCatalog::hashPath(path);
+}
+
+uint16_t shelfCoverStride() {
+  return static_cast<uint16_t>((Shelf::kCoverW + 3) / 4);
+}
+
+uint16_t shelfCoverBytes() {
+  return static_cast<uint16_t>(shelfCoverStride() * Shelf::kCoverH);
+}
+
+void shelfCachePath(const char* bookPath, char* out, size_t outLen) {
+  snprintf(out, outLen, "/BookCache/shelf/%08x.bin", static_cast<unsigned>(shelfPathHash(bookPath)));
+}
+
+uint64_t fileSizeForPath(const char* path) {
+  FsFile f = SdMan.open(path, O_RDONLY);
+  if (!f) return 0;
+  const uint64_t size = f.fileSize();
+  f.close();
+  return size;
+}
+
+uint32_t fnv1aUpdate(uint32_t hash, const uint8_t* data, size_t len) {
+  for (size_t i = 0; i < len; ++i) {
+    hash ^= data[i];
+    hash *= 16777619UL;
+  }
+  return hash;
+}
+
+uint32_t fileSampleHash(const char* path) {
+  FsFile f = SdMan.open(path, O_RDONLY);
+  if (!f) return 0;
+  uint32_t hash = 2166136261UL;
+  const uint64_t size = f.fileSize();
+  hash = fnv1aUpdate(hash, reinterpret_cast<const uint8_t*>(&size), sizeof(size));
+  uint8_t buf[128];
+  const uint32_t firstLen = static_cast<uint32_t>(size < sizeof(buf) ? size : sizeof(buf));
+  if (firstLen > 0 && f.seekSet(0)) {
+    const int n = f.read(buf, firstLen);
+    if (n > 0) hash = fnv1aUpdate(hash, buf, static_cast<size_t>(n));
+  }
+  if (size > sizeof(buf) && f.seekSet(size > sizeof(buf) ? size - sizeof(buf) : 0)) {
+    const int n = f.read(buf, sizeof(buf));
+    if (n > 0) hash = fnv1aUpdate(hash, buf, static_cast<size_t>(n));
+  }
+  f.close();
+  return hash;
+}
+
 const book::ManifestItem* chooseCoverItem(const book::Book& bk) {
   const book::ManifestItem* fallback = nullptr;
   for (size_t i = 0; i < bk.manifestCount(); ++i) {
@@ -599,20 +684,110 @@ bool coverDecodeRow(void* user, uint16_t y, const uint8_t* gray, uint16_t width)
   return true;
 }
 
+bool Shelf::loadCachedEntry(uint16_t index) {
+  if (index >= count) return false;
+  char path[96];
+  shelfCachePath(paths[index], path, sizeof(path));
+  FsFile f = SdMan.open(path, O_RDONLY);
+  if (!f) return false;
+
+  ShelfCacheHeader h;
+  const bool headerOk = f.read(&h, sizeof(h)) == static_cast<int>(sizeof(h));
+  if (!headerOk || h.magic != kShelfCacheMagic || h.version != kShelfCacheVersion ||
+      h.headerSize != sizeof(ShelfCacheHeader) || h.pathHash != shelfPathHash(paths[index]) ||
+      h.fileSize != fileSizeForPath(paths[index]) || h.sampleHash != fileSampleHash(paths[index]) ||
+      h.coverW != kCoverW || h.coverH != kCoverH || h.coverStride != shelfCoverStride() ||
+      h.coverBytes != shelfCoverBytes()) {
+    f.close();
+    return false;
+  }
+
+  snprintf(titles[index], sizeof(titles[index]), "%s", h.title);
+  snprintf(authors[index], sizeof(authors[index]), "%s", h.author);
+  snprintf(metas[index], sizeof(metas[index]), "%s", h.meta);
+  snprintf(coverHrefs[index], sizeof(coverHrefs[index]), "%s", h.coverHref);
+  items[index].label = titles[index];
+  items[index].subtitle = authors[index][0] ? authors[index] : metas[index];
+  detailsReady[index] = true;
+  coverTried[index] = h.coverTried != 0;
+
+  if (h.hasCover) {
+    uint8_t* bits = static_cast<uint8_t*>(psAlloc(h.coverBytes));
+    if (bits != nullptr && f.read(bits, h.coverBytes) == h.coverBytes) {
+      coverBits[index] = bits;
+      coverTried[index] = true;
+    } else if (bits != nullptr) {
+      free(bits);
+    }
+  }
+  f.close();
+  return true;
+}
+
+void Shelf::saveCachedEntry(uint16_t index) {
+  if (index >= count || !detailsReady[index]) return;
+  SdMan.ensureDirectoryExists("/BookCache");
+  SdMan.ensureDirectoryExists("/BookCache/shelf");
+
+  char path[96];
+  char tmpPath[104];
+  shelfCachePath(paths[index], path, sizeof(path));
+  snprintf(tmpPath, sizeof(tmpPath), "%s.tmp", path);
+
+  ShelfCacheHeader h;
+  h.magic = kShelfCacheMagic;
+  h.version = kShelfCacheVersion;
+  h.headerSize = sizeof(ShelfCacheHeader);
+  h.pathHash = shelfPathHash(paths[index]);
+  h.sampleHash = fileSampleHash(paths[index]);
+  h.fileSize = fileSizeForPath(paths[index]);
+  h.coverW = kCoverW;
+  h.coverH = kCoverH;
+  h.coverStride = shelfCoverStride();
+  h.coverBytes = shelfCoverBytes();
+  h.hasCover = coverBits[index] != nullptr ? 1 : 0;
+  h.coverTried = coverTried[index] ? 1 : 0;
+  snprintf(h.title, sizeof(h.title), "%s", titles[index]);
+  snprintf(h.author, sizeof(h.author), "%s", authors[index]);
+  snprintf(h.meta, sizeof(h.meta), "%s", metas[index]);
+  snprintf(h.coverHref, sizeof(h.coverHref), "%s", coverHrefs[index]);
+
+  FsFile f = SdMan.open(tmpPath, O_WRONLY | O_CREAT | O_TRUNC);
+  if (!f) return;
+  bool ok = f.write(&h, sizeof(h)) == sizeof(h);
+  if (ok && h.hasCover) {
+    ok = f.write(coverBits[index], h.coverBytes) == h.coverBytes;
+  }
+  f.close();
+  if (!ok) {
+    SdMan.remove(tmpPath);
+    return;
+  }
+  SdMan.remove(path);
+  SdMan.rename(tmpPath, path);
+}
+
 void Shelf::ensureDetails(uint16_t index) {
   if (index >= count || detailsReady[index]) return;
   detailsReady[index] = true;
   if (coverBookBuf == nullptr || coverScratchBuf == nullptr) return;
 
   SdBookSource source;
-  if (!source.open(paths[index])) return;
+  if (!source.open(paths[index])) {
+    LOGF("[cover] %s: SD open FAILED\n", paths[index]);
+    return;
+  }
 
   book::Arena bookArena;
   book::Arena scratch;
   bookArena.init(coverBookBuf, 128 * 1024);
   scratch.init(coverScratchBuf, 192 * 1024);
   book::Book bk;
-  if (bk.open(source, bookArena, scratch) == BookStatus::Ok) {
+  const BookStatus openStatus = bk.open(source, bookArena, scratch);
+  if (openStatus != BookStatus::Ok) {
+    LOGF("[cover] %s: book open status %d\n", paths[index], (int)openStatus);
+  }
+  if (openStatus == BookStatus::Ok) {
     if (bk.metadata().title != nullptr && bk.metadata().title[0] != 0) {
       snprintf(titles[index], sizeof(titles[index]), "%s", bk.metadata().title);
     }
@@ -622,11 +797,16 @@ void Shelf::ensureDetails(uint16_t index) {
     const book::ManifestItem* cover = chooseCoverItem(bk);
     if (cover != nullptr && cover->href != nullptr) {
       snprintf(coverHrefs[index], sizeof(coverHrefs[index]), "%s", cover->href);
+    } else {
+      LOGF("[cover] %s: no cover item in manifest\n", paths[index]);
     }
     snprintf(metas[index], sizeof(metas[index]), "%u chapters",
              static_cast<unsigned>(bk.spineCount()));
   }
   source.close();
+  items[index].label = titles[index];
+  items[index].subtitle = authors[index][0] ? authors[index] : metas[index];
+  saveCachedEntry(index);
 }
 
 bool Shelf::ensureCover(uint16_t index) {
@@ -635,16 +815,23 @@ bool Shelf::ensureCover(uint16_t index) {
   if (coverBits[index] != nullptr) return true;
   if (coverTried[index]) return false;
   coverTried[index] = true;
-  if (coverHrefs[index][0] == 0 || coverBookBuf == nullptr || coverScratchBuf == nullptr) return false;
+  if (coverHrefs[index][0] == 0 || coverBookBuf == nullptr || coverScratchBuf == nullptr) {
+    saveCachedEntry(index);
+    return false;
+  }
 
   const uint16_t stride = static_cast<uint16_t>((kCoverW + 3) / 4);
   uint8_t* bits = static_cast<uint8_t*>(psAlloc(static_cast<size_t>(stride) * kCoverH));
-  if (bits == nullptr) return false;
+  if (bits == nullptr) {
+    saveCachedEntry(index);
+    return false;
+  }
   memset(bits, 0xFF, static_cast<size_t>(stride) * kCoverH);
 
   SdBookSource source;
   if (!source.open(paths[index])) {
     free(bits);
+    saveCachedEntry(index);
     return false;
   }
   book::Arena bookArena;
@@ -680,17 +867,24 @@ bool Shelf::ensureCover(uint16_t index) {
       const uint16_t offsetY = static_cast<uint16_t>((kCoverH - drawH) / 2);
       book::PageImage image{coverHrefs[index], 0, 0, drawW, drawH};
       CoverDecodeCtx ctx{bits, stride, offsetX, offsetY};
-      ok = book::ImageRenderer::render(source, bk.zip(), image, scratch, coverDecodeRow, &ctx) == BookStatus::Ok;
+      const BookStatus rs =
+          book::ImageRenderer::render(source, bk.zip(), image, scratch, coverDecodeRow, &ctx);
+      ok = rs == BookStatus::Ok;
+      if (!ok) LOGF("[cover] %s: render status %d\n", coverHrefs[index], (int)rs);
       scratch.release(mark);
+    } else {
+      LOGF("[cover] %s: zip entry not found\n", coverHrefs[index]);
     }
   }
   source.close();
 
   if (!ok) {
     free(bits);
+    saveCachedEntry(index);
     return false;
   }
   coverBits[index] = bits;
+  saveCachedEntry(index);
   return true;
 }
 
@@ -704,8 +898,7 @@ ui::CoverGridItem Shelf::gridItem(uint16_t index, bool loadDetails) {
 }
 
 ui::CoverGridItem libraryGridItem(uint16_t index, void*) {
-  extern bool libraryFastScrollFrame;
-  return shelf.gridItem(index, !libraryFastScrollFrame);
+  return shelf.gridItem(index);
 }
 
 ui::BitmapRef iconBook16();
@@ -781,11 +974,9 @@ void drawGray2Cover(ui::DrawTarget& draw, ui::Rect rect, const uint8_t* bits, ui
 
 bool libraryCoverPainter(ui::DrawTarget& draw, ui::Rect rect, const ui::CoverGridItem& item,
                          uint16_t index, void*) {
-  extern bool libraryFastScrollFrame;
   draw.fill(rect, ui::Paint::solid(ui::Color::White), 4);
   draw.stroke(rect, ui::Paint::solid(ui::Color::Black), 1, 4);
-  const bool hasCover = shelf.coverBits[index] != nullptr ||
-                        (!libraryFastScrollFrame && shelf.ensureCover(index));
+  const bool hasCover = shelf.ensureCover(index);
   if (hasCover) {
     drawGray2Cover(draw, rect.inset(ui::Insets{3, 3, 3, 3}), shelf.coverBits[index], Shelf::kCoverW,
                    Shelf::kCoverH);
@@ -805,14 +996,12 @@ bool libraryCoverPainter(ui::DrawTarget& draw, ui::Rect rect, const ui::CoverGri
 }
 
 void drawLibraryCoverPreview(ui::DrawTarget& draw, ui::Rect rect, uint16_t index) {
-  extern bool libraryFastScrollFrame;
   if (rect.height <= 0 || rect.width <= 0 || index >= shelf.count) return;
   draw.fill(rect, ui::Paint::solid(ui::Color::White), 4);
   draw.stroke(rect, ui::Paint::solid(ui::Color::Black), 1, 4);
   ui::Rect cover = rect.inset(ui::Insets{3, 3, 0, 3});
   if (cover.height <= 0) return;
-  const bool hasCover = shelf.coverBits[index] != nullptr ||
-                        (!libraryFastScrollFrame && shelf.ensureCover(index));
+  const bool hasCover = shelf.ensureCover(index);
   if (hasCover) {
     const uint8_t* bits = shelf.coverBits[index];
     const uint16_t srcW = Shelf::kCoverW;
@@ -1180,6 +1369,89 @@ void libraryScreen(App::ScreenType& s, void*) {
   }
 }
 
+void drawFreeInkLogoDots(ui::DrawTarget& draw, const ui::Rect rect, const uint8_t phase,
+                         const bool activeAnimation) {
+  const int16_t cell = static_cast<int16_t>(rect.width / 5);
+  const int16_t dot = static_cast<int16_t>(cell / 2);
+  const int16_t radius = static_cast<int16_t>(dot / 2);
+  const int16_t gridW = static_cast<int16_t>(cell * 4 + dot);
+  const int16_t x0 = static_cast<int16_t>(rect.x + (rect.width - gridW) / 2);
+  const int16_t y0 = static_cast<int16_t>(rect.y + (rect.height - gridW) / 2);
+  for (uint8_t r = 0; r < 5; ++r) {
+    for (uint8_t c = 0; c < 5; ++c) {
+      const bool escaping = r <= 1 && c >= 3;
+      ui::Paint ink = ui::Paint::solid(ui::Color::Black);
+      if (escaping) {
+        if (!activeAnimation) {
+          ink = (r == 0 && c == 4) ? ui::Paint::dither(ui::Color::LightGray)
+                                   : ui::Paint::dither(ui::Color::DarkGray);
+        } else {
+          const uint8_t dotIndex = static_cast<uint8_t>((r * 2) + (c - 3));
+          const bool active = dotIndex == (phase % 4);
+          ink = active ? ui::Paint::solid(ui::Color::Black)
+                       : ui::Paint::dither(dotIndex == 1 ? ui::Color::LightGray : ui::Color::DarkGray);
+        }
+      }
+      const int16_t cx = static_cast<int16_t>(x0 + c * cell);
+      const int16_t cy = static_cast<int16_t>(y0 + r * cell);
+      draw.fill(ui::Rect{cx, cy, dot, dot}, ink, radius);
+    }
+  }
+}
+
+void drawProgressDots(ui::DrawTarget& draw, const ui::Rect rect, const uint8_t phase) {
+  const int16_t dot = 8;
+  const int16_t gap = 12;
+  const int16_t total = static_cast<int16_t>(dot * 3 + gap * 2);
+  const int16_t x0 = static_cast<int16_t>(rect.x + (rect.width - total) / 2);
+  const int16_t y = static_cast<int16_t>(rect.y + (rect.height - dot) / 2);
+  for (uint8_t i = 0; i < 3; ++i) {
+    const bool active = i == (phase % 3);
+    draw.fill(ui::Rect{static_cast<int16_t>(x0 + i * (dot + gap)), y, dot, dot},
+              active ? ui::Paint::solid(ui::Color::Black)
+                     : ui::Paint::dither(ui::Color::LightGray),
+              static_cast<uint8_t>(dot / 2));
+  }
+}
+
+void bootScreen(App::ScreenType& s, void*) {
+  ui::DrawTarget& draw = s.frame().target();
+  const ui::Rect body = s.body();
+  const int16_t logoSize = 190;
+  const int16_t logoY = static_cast<int16_t>(body.y + (body.height - 300) / 2);
+  drawFreeInkLogoDots(draw,
+                      ui::Rect{static_cast<int16_t>(body.x + (body.width - logoSize) / 2), logoY,
+                               logoSize, logoSize},
+                      loadingPhase, true);
+
+  ui::TextStyle title = s.theme().bodyText;
+  title.align = ui::TextAlign::Center;
+  title.bold = true;
+  draw.text(ui::Rect{body.x, static_cast<int16_t>(logoY + logoSize + 26), body.width, 28},
+            "Loading your library", title);
+  drawProgressDots(draw,
+                   ui::Rect{body.x, static_cast<int16_t>(logoY + logoSize + 62), body.width, 24},
+                   loadingPhase);
+}
+
+void sleepScreen(App::ScreenType& s, void*) {
+  ui::DrawTarget& draw = s.frame().target();
+  const ui::Rect body = s.body();
+  const int16_t logoSize = 164;
+  const int16_t logoY = static_cast<int16_t>(body.y + (body.height - 270) / 2);
+  drawFreeInkLogoDots(draw,
+                      ui::Rect{static_cast<int16_t>(body.x + (body.width - logoSize) / 2), logoY,
+                               logoSize, logoSize},
+                      0, false);
+
+  ui::TextStyle title = s.theme().bodyText;
+  title.align = ui::TextAlign::Center;
+  title.bold = true;
+  draw.text(ui::Rect{body.x, static_cast<int16_t>(logoY + logoSize + 30), body.width, 28},
+            "Sleeping", title);
+
+}
+
 void readerScreen(App::ScreenType& s, void*) {
   // Page content is composited after app render; the screen contributes the
   // full-page tap zones. Contents is opened with a top-edge swipe.
@@ -1260,7 +1532,7 @@ void settingsScreen(App::ScreenType& s, void*) {
   const int16_t rowH = static_cast<int16_t>(s.target().lineHeight(label.font) +
                                             s.target().lineHeight(s.theme().smallText.font) + 16);
   const int16_t rowGap = static_cast<int16_t>(s.theme().spaceMd * rowH / s.theme().rowHeight);
-  static constexpr uint16_t kSettingsRows = 12;
+  static constexpr uint16_t kSettingsRows = 13;
   settingsVisibleRows = ui::listVisibleRows(settingsBody, rowH, rowGap);
   if (settingsVisibleRows == 0) settingsVisibleRows = 1;
   if (settingsVisibleRows > kSettingsRows) settingsVisibleRows = kSettingsRows;
@@ -1518,16 +1790,112 @@ void goToPage(Screen next, bool initialPaint = false) {
   screen = next;
   app->clearTapFlash();
   switch (next) {
+    case Screen::Boot: app->setScreen(bootScreen, nullptr, ui::RefreshHint::None); break;
     case Screen::Library: app->setScreen(libraryScreen, nullptr, ui::RefreshHint::None); break;
     case Screen::Reader: app->setScreen(readerScreen, nullptr, ui::RefreshHint::None); break;
     case Screen::Toc: app->setScreen(tocScreen, nullptr, ui::RefreshHint::None); break;
     case Screen::Settings: app->setScreen(settingsScreen, nullptr, ui::RefreshHint::None); break;
+    case Screen::Sleep: app->setScreen(sleepScreen, nullptr, ui::RefreshHint::None); break;
   }
   if (initialPaint) {
     app->invalidate(ui::RefreshHint::Full);
   } else {
     app->invalidateTransition();
   }
+}
+
+void paintLoadingScreen(const bool waitForRefresh = true) {
+  loadingPhase = static_cast<uint8_t>(loadingPhase + 1);
+  if (screen != Screen::Boot) {
+    goToPage(Screen::Boot, /*initialPaint=*/true);
+  } else {
+    app->invalidate(ui::RefreshHint::Fast);
+  }
+  if (display.refreshBusy()) {
+    if (!waitForRefresh) return;
+    while (display.refreshBusy()) {
+      delay(10);
+    }
+  }
+  app->render();
+  ui::presentAsync(display, app->lastRenderRefreshHint());
+  if (waitForRefresh) {
+    while (display.refreshBusy()) {
+      delay(10);
+    }
+  }
+}
+
+bool libraryNeedsPreloadWork() {
+  for (int i = 0; i < shelf.count; ++i) {
+    if (!shelf.detailsReady[i] || !shelf.coverTried[i]) return true;
+  }
+  return false;
+}
+
+void scanAndPreloadLibrary() {
+  shelf.scan();
+  const bool showLoading = libraryNeedsPreloadWork();
+  if (showLoading) paintLoadingScreen(false);
+  for (int i = 0; i < shelf.count; ++i) {
+    shelf.ensureDetails(static_cast<uint16_t>(i));
+    shelf.ensureCover(static_cast<uint16_t>(i));
+    if (showLoading) paintLoadingScreen(false);
+  }
+}
+
+void showSleepScreenAndPowerOff() {
+  session.end();
+  goToPage(Screen::Sleep, /*initialPaint=*/true);
+  app->render();
+  ui::presentAsync(display, ui::RefreshHint::Full);
+  while (display.refreshBusy()) {
+    delay(10);
+  }
+  delay(150);
+  PowerManager::deepSleepUntilPowerButton();
+}
+
+void scrollLibraryByPage(int8_t dir) {
+  if (shelf.count <= libraryVisibleCells || libraryVisibleCells == 0) return;
+  const uint16_t step = libraryVisibleCells;
+  const uint16_t maxSelected = static_cast<uint16_t>(shelf.count - 1);
+  if (dir > 0) {
+    librarySelected = static_cast<int16_t>(
+        librarySelected + step > maxSelected ? maxSelected : librarySelected + step);
+  } else {
+    librarySelected = librarySelected > step ? static_cast<int16_t>(librarySelected - step) : 0;
+  }
+  app->invalidate(ui::RefreshHint::Fast);
+}
+
+void scrollTocByPage(int8_t dir) {
+  const uint16_t tocCount = static_cast<uint16_t>(
+      (session.bk.tocCount() > 0 ? session.bk.tocCount() : session.bk.spineCount()) < 128
+          ? (session.bk.tocCount() > 0 ? session.bk.tocCount() : session.bk.spineCount())
+          : 128);
+  if (tocCount <= tocVisibleRows || tocVisibleRows == 0) return;
+  const uint16_t maxTop = static_cast<uint16_t>(tocCount - tocVisibleRows);
+  const uint16_t step = tocVisibleRows > 1 ? static_cast<uint16_t>(tocVisibleRows - 1) : 1;
+  if (dir > 0) {
+    tocTop = static_cast<uint16_t>(tocTop + step > maxTop ? maxTop : tocTop + step);
+  } else {
+    tocTop = tocTop > step ? static_cast<uint16_t>(tocTop - step) : 0;
+  }
+  app->invalidate(ui::RefreshHint::Fast);
+}
+
+void scrollSettingsByRow(int8_t dir) {
+  if (settingsMenu != 0) return;
+  static constexpr uint16_t kSettingsRows = 13;
+  if (kSettingsRows <= settingsVisibleRows || settingsVisibleRows == 0) return;
+  const uint16_t maxTop = static_cast<uint16_t>(kSettingsRows - settingsVisibleRows);
+  if (dir > 0) {
+    settingsTop = settingsTop < maxTop ? static_cast<uint16_t>(settingsTop + 1) : maxTop;
+  } else {
+    settingsTop = settingsTop > 0 ? static_cast<uint16_t>(settingsTop - 1) : 0;
+  }
+  app->invalidate(ui::RefreshHint::Fast);
 }
 
 // ---------------------------------------------------------------------------
@@ -1724,28 +2092,6 @@ void setup() {
   coverBookBuf = psAlloc(128 * 1024);
   coverScratchBuf = psAlloc(192 * 1024);
 
-  // Reading font: the persisted Settings choice, defaulting to the first TTF
-  // found (or built-in when none). applyFont() always chains the built-in.
-  loadFontSetting();
-  fontShelf.scan();
-  if (currentFontName[0] == 0 && fontShelf.count > 0) {
-    snprintf(currentFontName, sizeof(currentFontName), "%s", fontShelf.names[0]);
-  }
-  applyFont();
-  applyUiFont();
-  applyOrientation();
-  uint32_t len = 0;
-  if (loadSdBlob("/fonts", ".fibh", &hyphData, &len)) {
-    hyphReady = hyphenator.init(hyphData, len);
-  }
-  // No pattern file on the card: fall back to the English patterns embedded
-  // in the SDK (tools/hyphc.py --header). Hyphenation is what keeps justified
-  // lines from stretching into word-gap canyons.
-  if (!hyphReady) hyphReady = hyphenator.init(book::k_hyph_en_us, book::k_hyph_en_us_size);
-
-  shelf.scan();
-  LOGF("[freeink-books] sd=%d books=%d font=%s\n", SdMan.ready() ? 1 : 0, shelf.count,
-       currentFontName[0] ? currentFontName : "(built-in)");
   app->on(ActionOpenBook, onOpenBook);
   app->on(ActionPageNext, onPageTurn);
   app->on(ActionPagePrev, onPageTurn);
@@ -1776,13 +2122,52 @@ void setup() {
   app->on(ActionCloseMenu, onCloseMenu);
   app->on(ActionRefreshLibrary, onRefreshLibrary);
   app->on(ActionBackToLibrary, onBackToLibrary);
+
+  scanAndPreloadLibrary();
   goToPage(Screen::Library, /*initialPaint=*/true);
+  app->render();
+  ui::presentAsync(display, app->lastRenderRefreshHint());
+
+  // Reading font: the persisted Settings choice, defaulting to the first TTF
+  // found (or built-in when none). applyFont() always chains the built-in.
+  loadFontSetting();
+  fontShelf.scan();
+  if (currentFontName[0] == 0 && fontShelf.count > 0) {
+    snprintf(currentFontName, sizeof(currentFontName), "%s", fontShelf.names[0]);
+  }
+  applyFont();
+  applyUiFont();
+  applyOrientation();
+  uint32_t len = 0;
+  if (loadSdBlob("/fonts", ".fibh", &hyphData, &len)) {
+    hyphReady = hyphenator.init(hyphData, len);
+  }
+  // No pattern file on the card: fall back to the English patterns embedded
+  // in the SDK (tools/hyphc.py --header). Hyphenation is what keeps justified
+  // lines from stretching into word-gap canyons.
+  if (!hyphReady) hyphReady = hyphenator.init(book::k_hyph_en_us, book::k_hyph_en_us_size);
+
+  LOGF("[freeink-books] sd=%d books=%d font=%s\n", SdMan.ready() ? 1 : 0, shelf.count,
+       currentFontName[0] ? currentFontName : "(built-in)");
 }
 
 void loop() {
+  bool releasedWakePowerThisLoop = false;
+  if (ignorePowerUntilRelease && !input.isPressed(InputManager::BTN_POWER)) {
+    ignorePowerUntilRelease = false;
+    releasedWakePowerThisLoop = true;
+  }
+
   // Hardware buttons (queued by the input task).
   uint8_t btn;
   while (input.popPress(btn)) {
+    if (btn == InputManager::BTN_POWER) {
+      if (ignorePowerUntilRelease || releasedWakePowerThisLoop) {
+        continue;
+      }
+      showSleepScreenAndPowerOff();
+      continue;
+    }
     if (screen == Screen::Reader && !readerChromeVisible) {
       if (btn == InputManager::BTN_DOWN && session.turn(1)) {
         app->invalidate(ui::RefreshHint::Fast);
@@ -1793,6 +2178,21 @@ void loop() {
         goToPage(Screen::Toc);
       }
       continue;
+    }
+    if (btn == InputManager::BTN_DOWN || btn == InputManager::BTN_UP) {
+      const int8_t dir = btn == InputManager::BTN_DOWN ? 1 : -1;
+      if (screen == Screen::Library) {
+        scrollLibraryByPage(dir);
+        continue;
+      }
+      if (screen == Screen::Toc) {
+        scrollTocByPage(dir);
+        continue;
+      }
+      if (screen == Screen::Settings) {
+        scrollSettingsByRow(dir);
+        continue;
+      }
     }
     ui::InputSnapshot b;
     b.focusNext = btn == InputManager::BTN_DOWN;
@@ -1843,8 +2243,6 @@ void loop() {
         } else {
           librarySelected = librarySelected > step ? static_cast<int16_t>(librarySelected - step) : 0;
         }
-        libraryFastScrollFrame = true;
-        libraryHydrateAfterScroll = true;
         app->invalidate(ui::RefreshHint::Fast);
       }
     } else if (screen == Screen::Toc && dy != 0) {
@@ -1863,7 +2261,7 @@ void loop() {
         app->invalidate(ui::RefreshHint::Fast);
       }
     } else if (screen == Screen::Settings && settingsMenu == 0 && dy != 0) {
-      static constexpr uint16_t kSettingsRows = 12;
+      static constexpr uint16_t kSettingsRows = 13;
       if (kSettingsRows > settingsVisibleRows && settingsVisibleRows > 0) {
         const uint16_t maxTop = static_cast<uint16_t>(kSettingsRows - settingsVisibleRows);
         if (dy < 0) {
@@ -1923,11 +2321,6 @@ void loop() {
   // Push the newest frame whenever the panel is idle.
   if (pending != ui::RefreshHint::None && !display.refreshBusy()) {
     ui::presentAsync(display, pending);
-    if (libraryHydrateAfterScroll) {
-      libraryFastScrollFrame = false;
-      libraryHydrateAfterScroll = false;
-      app->invalidate(ui::RefreshHint::Fast);
-    }
     if (libraryRefreshRequested && !libraryRefreshPainted) {
       libraryRefreshPainted = true;
     }
@@ -1935,7 +2328,7 @@ void loop() {
   }
 
   if (libraryRefreshRequested && libraryRefreshPainted && !display.refreshBusy()) {
-    shelf.scan();
+    scanAndPreloadLibrary();
     fontShelf.scan();
     if (librarySelected >= shelf.count) {
       librarySelected = shelf.count > 0 ? static_cast<int16_t>(shelf.count - 1) : 0;
@@ -1943,15 +2336,15 @@ void loop() {
     libraryTop = 0;
     libraryRefreshRequested = false;
     libraryRefreshPainted = false;
-    app->invalidate(ui::RefreshHint::Full);
+    goToPage(Screen::Library, /*initialPaint=*/true);
   }
 
   // Deep sleep only on a genuine live hold: GPIO4 is the shared
   // CONFIRM/POWER button, and a stale held-time reading here would put the
   // device to sleep right after boot (dead USB CDC, frozen panel).
-  if (input.isPressed(InputManager::BTN_POWER) && input.getPowerButtonHeldTime() > 1500) {
-    session.end();
-    PowerManager::deepSleepUntilPowerButton();
+  if (!ignorePowerUntilRelease && input.isPressed(InputManager::BTN_POWER) &&
+      input.getPowerButtonHeldTime() > 1500) {
+    showSleepScreenAndPowerOff();
   }
   delay(10);
 }
