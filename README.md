@@ -28,8 +28,8 @@ screens, settings, and the main loop (~0.7 MB binary).
 - **Settings** — reading font (any TTF/OTF on the card, with automatic
   `-Bold`/`-Italic`/`-BoldItalic` sibling loading), size, line spacing,
   page margins, alignment, hyphenation, sharp-vs-AA text, extra paragraph
-  spacing, embedded-styles toggle, UI font (CJK/Hangul chrome fallback),
-  and 4-way orientation. All persisted.
+  spacing, embedded-styles toggle, focus reading (bold word prefixes), UI
+  font (CJK/Hangul chrome fallback), and 4-way orientation. All persisted.
 
 ## SD card layout
 

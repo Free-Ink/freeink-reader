@@ -77,6 +77,7 @@ enum : ui::ActionId {
   ActionToggleSharp,
   ActionToggleParaSpace,
   ActionToggleEmbCss,
+  ActionToggleFocus,
   ActionOrientMenu,
   ActionPickOrient,
   ActionCloseMenu,
@@ -87,6 +88,21 @@ enum class Screen : uint8_t { Library, Reader, Toc, Settings };
 
 // ---------------------------------------------------------------------------
 // Stores
+
+bool containsIgnoreCase(const char* haystack, const char* needle) {
+  if (haystack == nullptr || needle == nullptr || needle[0] == 0) return false;
+  for (const char* h = haystack; *h; ++h) {
+    const char* a = h;
+    const char* b = needle;
+    while (*a && *b && tolower(static_cast<unsigned char>(*a)) ==
+                            tolower(static_cast<unsigned char>(*b))) {
+      ++a;
+      ++b;
+    }
+    if (*b == 0) return true;
+  }
+  return false;
+}
 
 struct Shelf {
   static constexpr int kMax = 64;
@@ -129,7 +145,10 @@ struct Shelf {
     for (const String& name : SdMan.listFiles(dir, kMax)) {
       const bool isEpub = name.endsWith(".epub");
       const bool isTxt = name.endsWith(".txt");
-      if (name.startsWith(".") || (!isEpub && !isTxt) || count >= kMax) continue;
+      const bool isCrashReport = containsIgnoreCase(name.c_str(), "crash") ||
+                                 containsIgnoreCase(name.c_str(), "panic") ||
+                                 containsIgnoreCase(name.c_str(), "backtrace");
+      if (name.startsWith(".") || isCrashReport || (!isEpub && !isTxt) || count >= kMax) continue;
       snprintf(paths[count], sizeof(paths[count]), "%s%s%s", dir, root ? "" : "/", name.c_str());
       snprintf(titles[count], sizeof(titles[count]), "%.*s",
                static_cast<int>(name.length() - (isEpub ? 5 : 4)), name.c_str());
@@ -146,7 +165,7 @@ struct Shelf {
 
   void ensureDetails(uint16_t index);
   bool ensureCover(uint16_t index);
-  ui::CoverGridItem gridItem(uint16_t index);
+  ui::CoverGridItem gridItem(uint16_t index, bool loadDetails = true);
 };
 
 struct Progress {  // persisted per book: (spineIndex, charStart, baseSizePx)
@@ -227,12 +246,13 @@ struct ReaderSession {
     params.stylesheet = isTxt ? nullptr : &sheet;
     extern uint16_t lineSpacingPct;
     extern uint16_t screenMarginPx;
-    extern uint8_t paraAlign, extraParaSpacing, embeddedStyles;
+    extern uint8_t paraAlign, extraParaSpacing, embeddedStyles, focusReading;
     params.marginLeft = params.marginRight = static_cast<int16_t>(screenMarginPx);
     params.marginTop = params.marginBottom = static_cast<int16_t>(screenMarginPx > 20 ? 20 : screenMarginPx);
     params.lineSpacingPct = lineSpacingPct;
     params.paragraphSpacingPct = extraParaSpacing ? 150 : 100;
     params.embeddedStyles = embeddedStyles != 0;
+    params.focusReading = focusReading != 0;
     params.hyphenator = hyph;
     static const book::TextAlign kAligns[4] = {book::TextAlign::Justify, book::TextAlign::Left,
                                                book::TextAlign::Center, book::TextAlign::Right};
@@ -465,6 +485,7 @@ uint8_t hyphenateSetting = 1;
 uint8_t sharpText = 0;           // 1 = Mono1Sharp (no AA dither)
 uint8_t extraParaSpacing = 0;    // 1 = 150% paragraph spacing
 uint8_t embeddedStyles = 1;
+uint8_t focusReading = 0;        // bold each word's first ~45% (fixation aid)
 uint8_t orientationSetting = 0;  // 0 portrait, 1 landscape, 2 portrait flipped, 3 landscape flipped
 static const ui::Orientation kUiOrient[4] = {
     ui::Orientation::Portrait, ui::Orientation::LandscapeCounterClockwise,
@@ -488,12 +509,17 @@ bool fontReady = false;
 Screen screen = Screen::Library;
 int16_t librarySelected = 0;
 uint16_t libraryTop = 0;
+uint16_t libraryVisibleCells = 0;
+bool libraryFastScrollFrame = false;
+bool libraryHydrateAfterScroll = false;
 uint16_t tocTop = 0;
 uint16_t tocVisibleRows = 0;
 bool tocAnchorSelected = false;
 uint16_t settingsTop = 0;
 uint16_t settingsVisibleRows = 0;
 bool readerChromeVisible = false;
+bool libraryRefreshRequested = false;
+bool libraryRefreshPainted = false;
 char statusText[96];
 
 uint8_t* bookBuf = nullptr;      // 256 KB PSRAM
@@ -527,21 +553,6 @@ bool loadSdBlob(const char* dir, const char* ext, uint8_t** out, uint32_t* lenOu
       *lenOut = len;
       return true;
     }
-  }
-  return false;
-}
-
-bool containsIgnoreCase(const char* haystack, const char* needle) {
-  if (haystack == nullptr || needle == nullptr || needle[0] == 0) return false;
-  for (const char* h = haystack; *h; ++h) {
-    const char* a = h;
-    const char* b = needle;
-    while (*a && *b && tolower(static_cast<unsigned char>(*a)) ==
-                            tolower(static_cast<unsigned char>(*b))) {
-      ++a;
-      ++b;
-    }
-    if (*b == 0) return true;
   }
   return false;
 }
@@ -683,8 +694,8 @@ bool Shelf::ensureCover(uint16_t index) {
   return true;
 }
 
-ui::CoverGridItem Shelf::gridItem(uint16_t index) {
-  ensureDetails(index);
+ui::CoverGridItem Shelf::gridItem(uint16_t index, bool loadDetails) {
+  if (loadDetails) ensureDetails(index);
   ui::CoverGridItem item;
   item.title = index < count ? titles[index] : "";
   item.actionValue = static_cast<int16_t>(index);
@@ -693,7 +704,8 @@ ui::CoverGridItem Shelf::gridItem(uint16_t index) {
 }
 
 ui::CoverGridItem libraryGridItem(uint16_t index, void*) {
-  return shelf.gridItem(index);
+  extern bool libraryFastScrollFrame;
+  return shelf.gridItem(index, !libraryFastScrollFrame);
 }
 
 ui::BitmapRef iconBook16();
@@ -769,9 +781,12 @@ void drawGray2Cover(ui::DrawTarget& draw, ui::Rect rect, const uint8_t* bits, ui
 
 bool libraryCoverPainter(ui::DrawTarget& draw, ui::Rect rect, const ui::CoverGridItem& item,
                          uint16_t index, void*) {
+  extern bool libraryFastScrollFrame;
   draw.fill(rect, ui::Paint::solid(ui::Color::White), 4);
   draw.stroke(rect, ui::Paint::solid(ui::Color::Black), 1, 4);
-  if (shelf.ensureCover(index)) {
+  const bool hasCover = shelf.coverBits[index] != nullptr ||
+                        (!libraryFastScrollFrame && shelf.ensureCover(index));
+  if (hasCover) {
     drawGray2Cover(draw, rect.inset(ui::Insets{3, 3, 3, 3}), shelf.coverBits[index], Shelf::kCoverW,
                    Shelf::kCoverH);
     return true;
@@ -784,9 +799,59 @@ bool libraryCoverPainter(ui::DrawTarget& draw, ui::Rect rect, const ui::CoverGri
   title.align = ui::TextAlign::Center;
   title.color = ui::Color::White;
   title.inverted = true;
-  title.maxLines = 7;
-  draw.text(cover.inset(ui::Insets{18, 24, 48, 24}), item.title, title);
+  title.maxLines = 5;
+  draw.text(cover.inset(ui::Insets{18, 24, 92, 24}), item.title, title);
   return true;
+}
+
+void drawLibraryCoverPreview(ui::DrawTarget& draw, ui::Rect rect, uint16_t index) {
+  extern bool libraryFastScrollFrame;
+  if (rect.height <= 0 || rect.width <= 0 || index >= shelf.count) return;
+  draw.fill(rect, ui::Paint::solid(ui::Color::White), 4);
+  draw.stroke(rect, ui::Paint::solid(ui::Color::Black), 1, 4);
+  ui::Rect cover = rect.inset(ui::Insets{3, 3, 0, 3});
+  if (cover.height <= 0) return;
+  const bool hasCover = shelf.coverBits[index] != nullptr ||
+                        (!libraryFastScrollFrame && shelf.ensureCover(index));
+  if (hasCover) {
+    const uint8_t* bits = shelf.coverBits[index];
+    const uint16_t srcW = Shelf::kCoverW;
+    const uint16_t srcH = Shelf::kCoverH;
+    const uint16_t stride = static_cast<uint16_t>((srcW + 3) / 4);
+    const int16_t fullW = static_cast<int16_t>(rect.width - 6);
+    const int16_t fullH = static_cast<int16_t>(Shelf::kCoverH - 6);
+    for (int16_t dy = 0; dy < cover.height; ++dy) {
+      const uint16_t sy = static_cast<uint16_t>((static_cast<int32_t>(dy) * srcH) / fullH);
+      int16_t runX = 0;
+      uint8_t runLevel = 3;
+      bool haveRun = false;
+      for (int16_t dx = 0; dx <= cover.width; ++dx) {
+        uint8_t level = 3;
+        if (dx < cover.width) {
+          const uint16_t sx = static_cast<uint16_t>((static_cast<int32_t>(dx) * srcW) / fullW);
+          const uint8_t byte = bits[static_cast<uint32_t>(sy) * stride + sx / 4];
+          const uint8_t shift = static_cast<uint8_t>((3 - (sx & 3)) * 2);
+          level = static_cast<uint8_t>((byte >> shift) & 0x03);
+        }
+        if (!haveRun) {
+          runX = dx;
+          runLevel = level;
+          haveRun = true;
+          continue;
+        }
+        if (level == runLevel) continue;
+        if (runLevel != 3) {
+          draw.fill(ui::Rect{static_cast<int16_t>(cover.x + runX), static_cast<int16_t>(cover.y + dy),
+                             static_cast<int16_t>(dx - runX), 1},
+                    paintForGray2(runLevel));
+        }
+        runX = dx;
+        runLevel = level;
+      }
+    }
+  } else {
+    draw.fill(cover, ui::Paint::solid(ui::Color::Black), 2);
+  }
 }
 
 ui::BitmapRef iconBook16() {
@@ -860,6 +925,7 @@ void saveFontSetting() {
     f.write(&extraParaSpacing, 1);
     f.write(&embeddedStyles, 1);
     f.write(&orientationSetting, 1);
+    f.write(&focusReading, 1);
     f.close();
   }
 }
@@ -880,6 +946,8 @@ void loadFontSetting() {
     f.read(&extraParaSpacing, 1);
     f.read(&embeddedStyles, 1);
     f.read(&orientationSetting, 1);
+    if (f.read(&focusReading, 1) != 1) focusReading = 0;  // pre-focus settings file
+    if (focusReading > 1) focusReading = 0;
     if (orientationSetting > 3) orientationSetting = 0;
     f.close();
     if (lineSpacingPct < 90 || lineSpacingPct > 200) lineSpacingPct = 100;
@@ -1025,27 +1093,29 @@ void libraryScreen(App::ScreenType& s, void*) {
   h1.titleOffsetY = -4;
   h1.borderEdges = 0;  // borderless: it is a headline, not chrome
   s.header(h1);
-  s.spacer(24);
-  ui::Rect actions = s.takeBottom(96);
+  s.spacer(12);
+  ui::Rect actions = s.takeBottom(18);
   ui::ButtonProps settings;
   settings.icon = iconSettings24();
-  settings.iconSize = 48;  // scaled up from the 24px asset
+  settings.iconSize = 34;  // scaled up from the 24px asset, but keep footer compact
   settings.action = ActionSettings;
   settings.styles = s.theme().button;
   settings.radius = 8;
-  settings.minTouchSize = 88;
-  settings.hitPadding = {4, 8, 4, 8};
-  ui::Rect settingsRect{static_cast<int16_t>(actions.right() - 96), actions.y, 88, 88};
+  settings.minTouchSize = 44;
+  settings.hitPadding = {2, 4, 2, 4};
+  ui::Rect settingsRect{static_cast<int16_t>(actions.right() - 48),
+                        static_cast<int16_t>(actions.bottom() - 44), 44, 44};
   ui::button(s.frame(), settingsRect, settings);
   if (shelf.count == 0) {
     s.centeredText("No books found.\nCopy .epub files to /Books on the SD card.");
     return;
   }
-  ui::Rect body = s.body();
+  const ui::Rect gridBounds = s.body();
+  ui::Rect body = gridBounds;
   const uint8_t columns = 2;
   const int16_t rowHeight = static_cast<int16_t>(Shelf::kCoverH + 8);
-  const int16_t rowGap = 22;
-  const int16_t columnGap = 10;
+  const int16_t rowGap = 7;
+  const int16_t columnGap = 36;
   const int16_t packedGridW =
       static_cast<int16_t>(columns * (Shelf::kCoverW + 8) + (columns - 1) * columnGap);
   if (packedGridW < body.width) {
@@ -1053,6 +1123,7 @@ void libraryScreen(App::ScreenType& s, void*) {
     body.width = packedGridW;
   }
   const uint16_t visible = ui::coverGridVisibleCells(body, columns, rowHeight, rowGap);
+  libraryVisibleCells = visible;
   libraryTop = ui::coverGridTopIndexFor(static_cast<uint16_t>(librarySelected),
                                         static_cast<uint16_t>(shelf.count), columns, visible);
   ui::CoverGridProps grid;
@@ -1074,7 +1145,39 @@ void libraryScreen(App::ScreenType& s, void*) {
   grid.selectedCoverFrameWidth = 2;
   grid.selectedCoverFrameRadius = 5;
   grid.coverPainter = libraryCoverPainter;
+  grid.scrollIndicator = false;
   ui::coverGrid(s.frame(), body, grid);
+
+  const uint16_t visibleRows = static_cast<uint16_t>(visible / columns);
+  const int16_t strideY = static_cast<int16_t>(rowHeight + rowGap);
+  const int16_t partialY = static_cast<int16_t>(body.y + visibleRows * strideY);
+  const int16_t partialH = static_cast<int16_t>(body.bottom() - partialY);
+  const uint16_t previewStart = static_cast<uint16_t>(libraryTop + visible);
+  if (partialH >= 24 && previewStart < shelf.count && visibleRows > 0) {
+    const int16_t cellW = static_cast<int16_t>((body.width - (columns - 1) * columnGap) / columns);
+    const int16_t previewH = partialH;
+    for (uint8_t col = 0; col < columns && previewStart + col < shelf.count; ++col) {
+      ui::Rect cell{static_cast<int16_t>(body.x + col * (cellW + columnGap)), partialY, cellW, previewH};
+      ui::Rect cover{static_cast<int16_t>(cell.x + (cell.width - Shelf::kCoverW) / 2), cell.y,
+                     Shelf::kCoverW, previewH};
+      drawLibraryCoverPreview(s.frame().target(), cover, static_cast<uint16_t>(previewStart + col));
+    }
+  }
+
+  if (shelf.count > visible && visible > 0) {
+    const int16_t trackW = 3;
+    const int16_t trackX = static_cast<int16_t>(gridBounds.right() - trackW);
+    s.frame().target().fill(ui::Rect{trackX, gridBounds.y, trackW, gridBounds.height},
+                            ui::Paint::dither(ui::Color::LightGray));
+    int16_t thumbH = static_cast<int16_t>((static_cast<int32_t>(gridBounds.height) * visible) / shelf.count);
+    if (thumbH < 18) thumbH = 18;
+    const uint16_t range = static_cast<uint16_t>(shelf.count - visible);
+    int16_t thumbY = static_cast<int16_t>(
+        gridBounds.y + (range > 0 ? (static_cast<int32_t>(gridBounds.height - thumbH) * libraryTop) / range : 0));
+    if (libraryTop >= range) thumbY = static_cast<int16_t>(gridBounds.bottom() - thumbH);
+    s.frame().target().fill(ui::Rect{trackX, thumbY, trackW, thumbH},
+                            ui::Paint::solid(ui::Color::Black));
+  }
 }
 
 void readerScreen(App::ScreenType& s, void*) {
@@ -1146,6 +1249,10 @@ void settingsScreen(App::ScreenType& s, void*) {
   snprintf(summary, sizeof(summary), "%d books", shelf.count);
   s.navHeader("Settings", ActionBackToLibrary, ui::BitmapRef{}, nullptr, ui::EdgesNone);
   s.insetContent({8, 12, 0, 12});
+  if (libraryRefreshRequested) {
+    s.centeredText("Scanning Library...\nChecking the SD card for books.");
+    return;
+  }
   const ui::Rect settingsBody = s.body();
 
   ui::TextStyle label = s.theme().bodyText;
@@ -1278,6 +1385,7 @@ void settingsScreen(App::ScreenType& s, void*) {
   toggle("Sharp Text (no AA)", sharpText != 0, ActionToggleSharp);
   toggle("Extra Paragraph Spacing", extraParaSpacing != 0, ActionToggleParaSpace);
   toggle("Embedded Book Styles", embeddedStyles != 0, ActionToggleEmbCss);
+  toggle("Focus Reading", focusReading != 0, ActionToggleFocus);
 
   if (kSettingsRows > settingsVisibleRows) {
     const int16_t trackW = 3;
@@ -1482,8 +1590,9 @@ void onSettings(const ui::ActionEvent&, void*) {
 }
 
 void onRefreshLibrary(const ui::ActionEvent&, void*) {
-  shelf.scan();
-  if (screen == Screen::Settings) fontShelf.scan();
+  settingsMenu = 0;
+  libraryRefreshRequested = true;
+  libraryRefreshPainted = false;
   app->invalidate(ui::RefreshHint::Full);
 }
 
@@ -1535,6 +1644,7 @@ void onToggleHyphen(const ui::ActionEvent&, void*) { hyphenateSetting ^= 1; save
 void onToggleSharp(const ui::ActionEvent&, void*) { sharpText ^= 1; saveFontSetting(); app->invalidate(ui::RefreshHint::Fast); }
 void onToggleParaSpace(const ui::ActionEvent&, void*) { extraParaSpacing ^= 1; saveFontSetting(); app->invalidate(ui::RefreshHint::Fast); }
 void onToggleEmbCss(const ui::ActionEvent&, void*) { embeddedStyles ^= 1; saveFontSetting(); app->invalidate(ui::RefreshHint::Fast); }
+void onToggleFocus(const ui::ActionEvent&, void*) { focusReading ^= 1; saveFontSetting(); app->invalidate(ui::RefreshHint::Fast); }
 
 void onCloseMenu(const ui::ActionEvent&, void*) {
   settingsMenu = 0;
@@ -1660,6 +1770,7 @@ void setup() {
   app->on(ActionToggleSharp, onToggleSharp);
   app->on(ActionToggleParaSpace, onToggleParaSpace);
   app->on(ActionToggleEmbCss, onToggleEmbCss);
+  app->on(ActionToggleFocus, onToggleFocus);
   app->on(ActionOrientMenu, onOrientMenu);
   app->on(ActionPickOrient, onPickOrient);
   app->on(ActionCloseMenu, onCloseMenu);
@@ -1694,7 +1805,7 @@ void loop() {
   // top-edge downward swipe opens contents. Regular list swipes are handled only
   // when they do not originate in those edge bands.
   float sx0, sy0, sx1, sy1;
-  while (screen != Screen::Library && input.popSwipe(sx0, sy0, sx1, sy1)) {
+  while (input.popSwipe(sx0, sy0, sx1, sy1)) {
     const ui::Point a = ui::touchToLogical(app->device(), sx0, sy0);
     const ui::Point b = ui::touchToLogical(app->device(), sx1, sy1);
     const int16_t h = app->device().height;
@@ -1711,7 +1822,7 @@ void loop() {
       tocAnchorSelected = true;
       goToPage(Screen::Toc);
       break;
-    } else if (verticalSwipe && a.y >= lowerEdge && dy < 0) {
+    } else if (screen != Screen::Library && verticalSwipe && a.y >= lowerEdge && dy < 0) {
       if (screen == Screen::Toc) {
         goToPage(Screen::Reader);
         break;
@@ -1721,6 +1832,20 @@ void loop() {
         }
         goToPage(Screen::Library);
         break;
+      }
+    } else if (screen == Screen::Library && verticalSwipe && dy != 0) {
+      if (shelf.count > libraryVisibleCells && libraryVisibleCells > 0) {
+        const uint16_t step = libraryVisibleCells;
+        const uint16_t maxSelected = static_cast<uint16_t>(shelf.count - 1);
+        if (dy < 0) {
+          librarySelected = static_cast<int16_t>(
+              librarySelected + step > maxSelected ? maxSelected : librarySelected + step);
+        } else {
+          librarySelected = librarySelected > step ? static_cast<int16_t>(librarySelected - step) : 0;
+        }
+        libraryFastScrollFrame = true;
+        libraryHydrateAfterScroll = true;
+        app->invalidate(ui::RefreshHint::Fast);
       }
     } else if (screen == Screen::Toc && dy != 0) {
       const uint16_t tocCount = static_cast<uint16_t>(
@@ -1798,7 +1923,27 @@ void loop() {
   // Push the newest frame whenever the panel is idle.
   if (pending != ui::RefreshHint::None && !display.refreshBusy()) {
     ui::presentAsync(display, pending);
+    if (libraryHydrateAfterScroll) {
+      libraryFastScrollFrame = false;
+      libraryHydrateAfterScroll = false;
+      app->invalidate(ui::RefreshHint::Fast);
+    }
+    if (libraryRefreshRequested && !libraryRefreshPainted) {
+      libraryRefreshPainted = true;
+    }
     pending = ui::RefreshHint::None;
+  }
+
+  if (libraryRefreshRequested && libraryRefreshPainted && !display.refreshBusy()) {
+    shelf.scan();
+    fontShelf.scan();
+    if (librarySelected >= shelf.count) {
+      librarySelected = shelf.count > 0 ? static_cast<int16_t>(shelf.count - 1) : 0;
+    }
+    libraryTop = 0;
+    libraryRefreshRequested = false;
+    libraryRefreshPainted = false;
+    app->invalidate(ui::RefreshHint::Full);
   }
 
   // Deep sleep only on a genuine live hold: GPIO4 is the shared
