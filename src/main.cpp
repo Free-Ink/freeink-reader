@@ -594,6 +594,10 @@ uint16_t settingsVisibleRows = 0;
 bool readerChromeVisible = false;
 bool libraryRefreshRequested = false;
 bool libraryRefreshPainted = false;
+int16_t pendingOpenShelfIndex = -1;
+bool pendingOpenToastVisible = false;
+bool pendingOpenToastPresented = false;
+uint32_t pendingOpenToastShownAt = 0;
 char statusText[96];
 uint8_t loadingPhase = 0;
 bool ignorePowerUntilRelease = true;
@@ -1868,7 +1872,7 @@ void drawProgressDots(ui::DrawTarget& draw, const ui::Rect rect, const uint8_t p
   }
 }
 
-void bootScreen(App::ScreenType& s, void*) {
+void loadingMessageScreen(App::ScreenType& s, const char* message) {
   ui::DrawTarget& draw = s.frame().target();
   const ui::Rect body = s.body();
   const int16_t logoSize = 190;
@@ -1882,10 +1886,14 @@ void bootScreen(App::ScreenType& s, void*) {
   title.align = ui::TextAlign::Center;
   title.bold = true;
   draw.text(ui::Rect{body.x, static_cast<int16_t>(logoY + logoSize + 26), body.width, 28},
-            "Loading your library", title);
+            message, title);
   drawProgressDots(draw,
                    ui::Rect{body.x, static_cast<int16_t>(logoY + logoSize + 62), body.width, 24},
                    loadingPhase);
+}
+
+void bootScreen(App::ScreenType& s, void*) {
+  loadingMessageScreen(s, "Loading your library");
 }
 
 void sleepScreen(App::ScreenType& s, void*) {
@@ -2344,6 +2352,51 @@ void paintLoadingScreen(const bool waitForRefresh = true) {
   }
 }
 
+bool presentIndexingToast() {
+  if (screen != Screen::Library || target == nullptr || app == nullptr || display.refreshBusy()) return false;
+
+  ui::InteractionBuffer<1> interactions;
+  ui::InputSnapshot input;
+  ui::Frame<1> frame(*target, app->device(), input, interactions, app->assets());
+  const ui::ThemeTokens& theme = app->theme();
+  ui::Rect bounds = frame.safeRect().inset(ui::Insets{0, 10, 0, 12});
+  bounds.height = static_cast<int16_t>(bounds.height - kLibraryTabHeight);
+  const int16_t gridTop = static_cast<int16_t>(theme.headerHeight + 4);
+  bounds.y = static_cast<int16_t>(bounds.y + gridTop);
+  bounds.height = static_cast<int16_t>(bounds.height > gridTop ? bounds.height - gridTop : 0);
+
+  ui::ToastProps toast;
+  toast.message = "Indexing...";
+  toast.text = theme.bodyText;
+  toast.styles = theme.popup;
+  toast.anchor = ui::ToastAnchor::Top;
+  toast.margin = 0;
+  toast.padding = ui::Insets{10, 18, 10, 18};
+  ui::toast(frame, bounds, toast);
+  ui::presentAsync(display, ui::RefreshHint::Fast);
+  return true;
+}
+
+void performPendingOpen() {
+  const int16_t shelfIndex = pendingOpenShelfIndex;
+  pendingOpenShelfIndex = -1;
+  pendingOpenToastVisible = false;
+  pendingOpenToastPresented = false;
+  if (shelfIndex < 0 || shelfIndex >= shelf.count) {
+    app->invalidate(ui::RefreshHint::Full);
+    return;
+  }
+  promoteRecentBook(static_cast<uint16_t>(shelfIndex));
+  if (session.begin(shelf.paths[shelfIndex], fonts, (hyphReady && hyphenateSetting) ? &hyphenator : nullptr, bookBuf,
+                    512 * 1024, scratchBuf, 512 * 1024, indexBuf, 64 * 1024)) {
+    readerChromeVisible = false;
+    tocTop = 0;
+    goToPage(Screen::Reader);
+  } else {
+    goToPage(Screen::Library, /*initialPaint=*/true);
+  }
+}
+
 bool libraryNeedsPreloadWork() {
   for (uint8_t i = 0; i < recentVisibleCount; ++i) {
     const int16_t shelfIndex = recentShelfForSlot[i];
@@ -2460,13 +2513,12 @@ void onOpenBook(const ui::ActionEvent& e, void*) {
   }
   if (shelfIndex < 0 || shelfIndex >= shelf.count) return;
   librarySelected = shelfIndex;
-  promoteRecentBook(static_cast<uint16_t>(shelfIndex));
-  if (session.begin(shelf.paths[shelfIndex], fonts, (hyphReady && hyphenateSetting) ? &hyphenator : nullptr, bookBuf,
-                    512 * 1024, scratchBuf, 512 * 1024, indexBuf, 64 * 1024)) {
-    readerChromeVisible = false;
-    tocTop = 0;
-    goToPage(Screen::Reader);
-  }
+  pendingOpenShelfIndex = shelfIndex;
+  pendingOpenToastVisible = true;
+  pendingOpenToastPresented = false;
+  pendingOpenToastShownAt = 0;
+  app->clearTapFlash();
+  app->invalidate(ui::RefreshHint::Fast);
 }
 
 void onPageTurn(const ui::ActionEvent& e, void*) {
@@ -2844,7 +2896,21 @@ void loop() {
   }
 
   static ui::RefreshHint pending = ui::RefreshHint::None;
-  if (app->invalidated()) {
+  if (pendingOpenShelfIndex >= 0 && pendingOpenToastVisible && !pendingOpenToastPresented) {
+    if (presentIndexingToast()) {
+      pendingOpenToastPresented = true;
+      pendingOpenToastShownAt = millis();
+      pending = ui::RefreshHint::None;
+      performPendingOpen();
+    }
+  }
+
+  if (pendingOpenShelfIndex >= 0 && pendingOpenToastPresented && !display.refreshBusy() &&
+      millis() - pendingOpenToastShownAt >= 80) {
+    performPendingOpen();
+  }
+
+  if (app->invalidated() && pendingOpenShelfIndex < 0) {
     app->render();
     // Composite the book page into the same framebuffer under the chrome.
     if (screen == Screen::Reader && session.open && !readerChromeVisible) {
